@@ -289,6 +289,8 @@ class RecordingShortcutManager: ObservableObject {
             )
         case .quickAddToDictionary:
             DictionaryQuickAddManager.shared.toggle(modelContainer: engine.modelContext.container)
+        case .toggleDictationLanguage:
+            DictationLanguageManager.shared.toggleEnglishSpanish()
         default:
             break
         }

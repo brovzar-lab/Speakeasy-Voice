@@ -13,6 +13,7 @@ struct MenuBarView: View {
     @EnvironmentObject var aiService: AIService
     @ObservedObject private var modeManager = ModeManager.shared
     @ObservedObject var audioDeviceManager = AudioDeviceManager.shared
+    @ObservedObject private var dictationLanguageManager = DictationLanguageManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
     
@@ -102,6 +103,32 @@ struct MenuBarView: View {
                     Image(systemName: "mic.fill")
                         .font(.system(size: 11, weight: .medium))
                     Text("Audio Input")
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10))
+                }
+            }
+
+            Menu {
+                Button {
+                    dictationLanguageManager.forcedLanguage = "en"
+                } label: {
+                    Text(dictationLanguageManager.forcedLanguage == "en" ? "English  ✓" : "English")
+                }
+                Button {
+                    dictationLanguageManager.forcedLanguage = "es"
+                } label: {
+                    Text(dictationLanguageManager.forcedLanguage == "es" ? "Español  ✓" : "Español")
+                }
+                Button {
+                    dictationLanguageManager.forcedLanguage = nil
+                } label: {
+                    Text(dictationLanguageManager.forcedLanguage == nil ? "Auto  ✓" : "Auto")
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "globe")
+                        .font(.system(size: 11, weight: .medium))
+                    Text(String(format: String(localized: "Language: %@"), dictationLanguageManager.displayName))
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 10))
                 }

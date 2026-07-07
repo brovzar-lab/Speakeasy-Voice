@@ -96,6 +96,13 @@ struct SettingsView: View {
                         .controlSize(.small)
                 }
 
+                LabeledContent("Toggle Dictation Language (EN/ES)") {
+                    ShortcutRecorder(action: .toggleDictationLanguage) {
+                        recordingShortcutManager.updateShortcutStatus()
+                    }
+                        .controlSize(.small)
+                }
+
                 LabeledContent("Cancel Recording") {
                     HStack(spacing: 8) {
                         ShortcutRecorder(

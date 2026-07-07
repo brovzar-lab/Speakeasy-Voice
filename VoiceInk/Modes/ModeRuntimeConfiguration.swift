@@ -71,8 +71,11 @@ enum ModeRuntimeResolver {
 
         guard let model else { return nil }
 
+        // A global forced language (set via the menu bar switch or toggle hotkey)
+        // overrides the per-mode language; nil means Auto / follow the mode.
+        let requestedLanguage = DictationLanguageManager.shared.forcedLanguage ?? mode?.selectedLanguage
         let language = TranscriptionLanguageSupport.validLanguageOrFallback(
-            mode?.selectedLanguage,
+            requestedLanguage,
             for: model,
             realtimeEnabled: mode?.isRealtimeTranscriptionEnabled
         )
