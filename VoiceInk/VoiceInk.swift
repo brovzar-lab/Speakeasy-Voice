@@ -296,7 +296,7 @@ struct VoiceInkApp: App {
     /// Requires Ollama running locally at http://localhost:11434 (checked live when
     /// a transcription actually runs; if it is down the app just skips cleanup).
     private static func seedOllamaCleanupIfNeeded(enhancementService: AIEnhancementService, aiService: AIService) {
-        let logger = Logger(subsystem: "com.prakashjoshipax.VoiceInk", category: "OllamaCleanupSeed")
+        let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "OllamaCleanupSeed")
         let seededKey = "hasSeededOllamaCleanup_v1"
         guard !UserDefaults.standard.bool(forKey: seededKey) else { return }
 
@@ -325,12 +325,13 @@ struct VoiceInkApp: App {
                 config.selectedPrompt = PromptTemplates.defaultPromptId.uuidString
             }
             manager.updateConfiguration(config)
+            UserDefaults.standard.set(true, forKey: seededKey)
             logger.info("✅ Enabled Ollama cleanup (\(cleanupModel)) on mode: \(config.name, privacy: .public)")
         } else {
-            logger.warning("⚠️ No mode configuration found; Ollama cleanup not attached to a mode")
+            // No dictation mode exists yet (e.g. onboarding unfinished). Leave the guard
+            // unset so this retries on a later launch once a mode has been created.
+            logger.warning("⚠️ No mode configuration found yet; will retry Ollama cleanup setup on next launch")
         }
-
-        UserDefaults.standard.set(true, forKey: seededKey)
     }
 
     private static func createInMemoryContainer(schema: Schema, logger: Logger) throws -> ModelContainer {

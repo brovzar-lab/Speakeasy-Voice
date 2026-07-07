@@ -28,8 +28,8 @@ final class SoundPlaybackEngine: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
 
-            self.startSound = self.makePlayer(from: defaultStartURL, volume: 0.3)
-            self.stopSound = self.makePlayer(from: defaultStopURL, volume: 0.3)
+            self.startSound = self.makePlayer(from: defaultStartURL, volume: 0.2)
+            self.stopSound = self.makePlayer(from: defaultStopURL, volume: 0.2)
             self.escSound = self.makePlayer(from: defaultEscURL, volume: 0.2)
             self.reloadCustomSoundsOnQueue(startURL: customStartURL, stopURL: customStopURL)
         }

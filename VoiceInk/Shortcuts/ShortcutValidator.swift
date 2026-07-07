@@ -91,6 +91,7 @@ enum ShortcutValidator {
     private static var allStoredActions: [ShortcutAction] {
         var seenActions = Set<ShortcutAction>()
         let actions = ShortcutAction.legacyKeyboardShortcutActions +
+            ShortcutAction.globalUtilityActions +
             ModeManager.shared.configurations.map { ShortcutAction.mode($0.id) }
 
         return actions.filter { seenActions.insert($0).inserted }

@@ -45,13 +45,4 @@ final class DictationLanguageManager: ObservableObject {
         default: return String(localized: "Auto")
         }
     }
-
-    /// Short code for compact display (menu bar), e.g. "EN" / "ES" / "AUTO".
-    var shortCode: String {
-        switch forcedLanguage {
-        case "en": return "EN"
-        case "es": return "ES"
-        default: return "AUTO"
-        }
-    }
 }

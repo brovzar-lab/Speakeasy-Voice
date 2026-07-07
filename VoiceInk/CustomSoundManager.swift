@@ -22,10 +22,8 @@ class CustomSoundManager: ObservableObject {
 
         var fileExtension: String {
             switch self {
-            case .sound1, .sound2, .sound3, .sound4, .sound7:
+            case .sound1, .sound2, .sound3, .sound4, .sound5, .sound6, .sound7:
                 return "wav"
-            case .sound5, .sound6:
-                return "mp3"
             }
         }
 
