@@ -149,7 +149,7 @@ struct SettingsView: View {
                     isExpanded: $isRestoreClipboardExpanded,
                     isEnabled: $restoreClipboardAfterPaste,
                     label: "Keep Clipboard Content",
-                    infoMessage: "VoiceInk temporarily uses the clipboard to paste transcription. When enabled, it restores your previous clipboard content after the selected delay. When disabled, the pasted transcription stays on your clipboard."
+                    infoMessage: "Speakeasy-Voice temporarily uses the clipboard to paste transcription. When enabled, it restores your previous clipboard content after the selected delay. When disabled, the pasted transcription stays on your clipboard."
                 ) {
                     Picker("Restore Delay", selection: $clipboardRestoreDelay) {
                         Text("250ms").tag(0.25)
@@ -307,10 +307,10 @@ struct SettingsView: View {
         } message: {
             Text("You'll see the introduction screens again the next time you launch the app.")
         }
-        .alert("Restart VoiceInk to Apply Language", isPresented: $showLanguageRestartAlert) {
+        .alert("Restart Speakeasy-Voice to Apply Language", isPresented: $showLanguageRestartAlert) {
             Button("OK", role: .cancel) { }
         } message: {
-            Text("Your language change will take full effect after you quit and reopen VoiceInk.")
+            Text("Your language change will take full effect after you quit and reopen Speakeasy-Voice.")
         }
     }
 

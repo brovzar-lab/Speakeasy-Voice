@@ -52,7 +52,7 @@ struct ModeTriggerSection: View {
         HStack {
             HStack(spacing: 4) {
                 Text("Triggers")
-                InfoTip("VoiceInk automatically switches to this mode based on the app or website you're using, or when you say a trigger word during recording.")
+                InfoTip("Speakeasy-Voice automatically switches to this mode based on the app or website you're using, or when you say a trigger word during recording.")
             }
 
             Spacer()

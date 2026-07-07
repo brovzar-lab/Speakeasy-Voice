@@ -33,11 +33,11 @@ enum DashboardInsightPeriod: String, CaseIterable, Identifiable, Sendable {
 
     var timeSavedContext: LocalizedStringKey {
         switch self {
-        case .today: return "with VoiceInk today"
-        case .lastSevenDays: return "with VoiceInk this week"
-        case .lastThirtyDays: return "with VoiceInk over the last 30 days"
-        case .thisYear: return "with VoiceInk this year"
-        case .allTime: return "with VoiceInk"
+        case .today: return "with Speakeasy-Voice today"
+        case .lastSevenDays: return "with Speakeasy-Voice this week"
+        case .lastThirtyDays: return "with Speakeasy-Voice over the last 30 days"
+        case .thisYear: return "with Speakeasy-Voice this year"
+        case .allTime: return "with Speakeasy-Voice"
         }
     }
 

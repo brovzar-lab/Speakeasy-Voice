@@ -10,7 +10,7 @@ enum ViewType: String, CaseIterable, Identifiable {
     case audio = "Audio"
     case dictionary = "Dictionary"
     case settings = "Settings"
-    case license = "VoiceInk Pro"
+    case license = "Speakeasy-Voice Pro"
 
     var id: String { rawValue }
 }

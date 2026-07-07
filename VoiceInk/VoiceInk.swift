@@ -67,7 +67,7 @@ struct VoiceInkApp: App {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = String(localized: "Storage Warning")
-                    alert.informativeText = String(localized: "VoiceInk couldn't access its storage location. Your transcriptions will not be saved between sessions.")
+                    alert.informativeText = String(localized: "Speakeasy-Voice couldn't access its storage location. Your transcriptions will not be saved between sessions.")
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: String(localized: "OK"))
                     alert.runModal()
@@ -76,7 +76,7 @@ struct VoiceInkApp: App {
                 let persistentDetail = Self.fullErrorDescription(persistentError)
                 let memoryDetail = Self.fullErrorDescription(memoryError)
                 logger.critical("❌ All ModelContainer init attempts failed.\nPersistent:\n\(persistentDetail, privacy: .public)\nIn-memory:\n\(memoryDetail, privacy: .public)")
-                fatalError("VoiceInk failed to initialize storage.\nPersistent:\n\(persistentDetail)\nIn-memory:\n\(memoryDetail)")
+                fatalError("Speakeasy-Voice failed to initialize storage.\nPersistent:\n\(persistentDetail)\nIn-memory:\n\(memoryDetail)")
             }
         }
 
@@ -240,10 +240,50 @@ struct VoiceInkApp: App {
         )
 
         do {
-            return try ModelContainer(for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig)
+            let container = try ModelContainer(for: schema, configurations: transcriptConfig, dictionaryConfig, statsConfig)
+            seedDefaultDictionaryIfNeeded(container: container, logger: logger)
+            return container
         } catch {
             logger.error("❌ Failed to create persistent ModelContainer:\n\(Self.fullErrorDescription(error), privacy: .public)")
             throw error
+        }
+    }
+
+    /// One-time seed of Billy's proper nouns so Speakeasy-Voice never misspells his world.
+    /// Vocabulary words steer AI enhancement; replacements fix casing after transcription.
+    private static func seedDefaultDictionaryIfNeeded(container: ModelContainer, logger: Logger) {
+        let seededKey = "hasSeededSpeakeasyDictionary_v1"
+        guard !UserDefaults.standard.bool(forKey: seededKey) else { return }
+
+        let vocabulary: [String] = [
+            "Lemon Studios", "Lemon Films", "Rovzar", "Billy Rovzar",
+            "EFICINE", "Oro Verde", "Hermes",
+            "Mauricio Llanes", "LLH Law"
+        ]
+        // Spelling / casing auto-corrections applied after transcription (case-insensitive match).
+        let replacements: [(original: String, replacement: String)] = [
+            ("eficine", "EFICINE"),
+            ("oro verde", "Oro Verde"),
+            ("lemon studios", "Lemon Studios"),
+            ("lemon films", "Lemon Films"),
+            ("rovzar", "Rovzar"),
+            ("llanes", "Llanes")
+        ]
+
+        let context = ModelContext(container)
+        for word in vocabulary {
+            context.insert(VocabularyWord(word: word))
+        }
+        for pair in replacements {
+            context.insert(WordReplacement(originalText: pair.original, replacementText: pair.replacement))
+        }
+
+        do {
+            try context.save()
+            UserDefaults.standard.set(true, forKey: seededKey)
+            logger.info("✅ Seeded default Speakeasy-Voice dictionary: \(vocabulary.count) vocabulary words, \(replacements.count) replacements")
+        } catch {
+            logger.error("❌ Failed to seed default dictionary:\n\(Self.fullErrorDescription(error), privacy: .public)")
         }
     }
 

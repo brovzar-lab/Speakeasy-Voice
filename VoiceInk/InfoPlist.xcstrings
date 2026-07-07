@@ -8,19 +8,19 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "VoiceInk"
+            "value" : "Speakeasy-Voice"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "VoiceInk"
+            "value" : "Speakeasy-Voice"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "VoiceInk"
+            "value": "Speakeasy-Voice"
           }
         }
       }
@@ -32,19 +32,19 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "VoiceInk"
+            "value" : "Speakeasy-Voice"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "VoiceInk"
+            "value" : "Speakeasy-Voice"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "VoiceInk"
+            "value": "Speakeasy-Voice"
           }
         }
       }
