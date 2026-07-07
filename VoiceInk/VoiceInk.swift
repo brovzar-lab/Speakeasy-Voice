@@ -94,6 +94,9 @@ struct VoiceInkApp: App {
         let enhancementService = AIEnhancementService(aiService: aiService, modelContext: resolvedContainer.mainContext)
         _enhancementService = StateObject(wrappedValue: enhancementService)
 
+        // Route dictation through the local Ollama cleanup model on first launch.
+        Self.seedOllamaCleanupIfNeeded(enhancementService: enhancementService, aiService: aiService)
+
         // 1. Create modelsDirectory URL
         let appSupportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("com.prakashjoshipax.VoiceInk")
@@ -285,6 +288,49 @@ struct VoiceInkApp: App {
         } catch {
             logger.error("❌ Failed to seed default dictionary:\n\(Self.fullErrorDescription(error), privacy: .public)")
         }
+    }
+
+    /// One-time setup that routes dictation through the local Ollama cleanup model
+    /// (gemma3:4b) after transcription: strips filler words ("um"/"uh"), fixes
+    /// punctuation and capitalization. Guarded by a UserDefaults flag so it runs once.
+    /// Requires Ollama running locally at http://localhost:11434 (checked live when
+    /// a transcription actually runs; if it is down the app just skips cleanup).
+    private static func seedOllamaCleanupIfNeeded(enhancementService: AIEnhancementService, aiService: AIService) {
+        let logger = Logger(subsystem: "com.prakashjoshipax.VoiceInk", category: "OllamaCleanupSeed")
+        let seededKey = "hasSeededOllamaCleanup_v1"
+        guard !UserDefaults.standard.bool(forKey: seededKey) else { return }
+
+        let cleanupModel = "gemma3:4b"
+
+        // Make sure the built-in "Default" cleanup prompt is registered.
+        let seedResult = StarterModePromptSeeder.ensurePrompts(for: [.enhance], in: enhancementService.customPrompts)
+        if seedResult.didChange {
+            enhancementService.customPrompts = seedResult.prompts
+        }
+
+        // Point the app's Ollama selection at the pulled cleanup model.
+        aiService.updateSelectedOllamaModel(cleanupModel)
+
+        // Turn on Ollama cleanup for the primary dictation mode so everything
+        // dictated gets polished, WhisperFlow-style.
+        let manager = ModeManager.shared
+        if let target = manager.getDefaultConfiguration()
+            ?? manager.currentEffectiveConfiguration
+            ?? manager.configurations.first {
+            var config = target
+            config.isAIEnhancementEnabled = true
+            config.selectedAIProvider = AIProvider.ollama.rawValue
+            config.selectedAIModel = cleanupModel
+            if config.selectedPrompt == nil {
+                config.selectedPrompt = PromptTemplates.defaultPromptId.uuidString
+            }
+            manager.updateConfiguration(config)
+            logger.info("✅ Enabled Ollama cleanup (\(cleanupModel)) on mode: \(config.name, privacy: .public)")
+        } else {
+            logger.warning("⚠️ No mode configuration found; Ollama cleanup not attached to a mode")
+        }
+
+        UserDefaults.standard.set(true, forKey: seededKey)
     }
 
     private static func createInMemoryContainer(schema: Schema, logger: Logger) throws -> ModelContainer {
