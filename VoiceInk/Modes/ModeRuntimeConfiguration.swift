@@ -103,8 +103,12 @@ enum ModeRuntimeResolver {
         aiService: AIService
     ) -> EnhancementRuntimeConfiguration {
         let mode = mode ?? ModeManager.shared.currentEffectiveConfiguration
+
+        // The active style preset overrides the mode's cleanup prompt and on/off state.
+        let preset = StylePresetManager.shared.activePreset
+        let promptIdString = preset.promptId?.uuidString ?? mode?.selectedPrompt
         let prompt = resolvedPrompt(
-            promptId: mode?.selectedPrompt,
+            promptId: promptIdString,
             enhancementService: enhancementService
         )
         let provider = resolvedProvider(
@@ -119,7 +123,7 @@ enum ModeRuntimeResolver {
 
         return EnhancementRuntimeConfiguration(
             mode: mode,
-            isEnabled: mode?.isAIEnhancementEnabled ?? false,
+            isEnabled: (preset != .raw) && (mode?.isAIEnhancementEnabled ?? false),
             prompt: prompt,
             provider: provider,
             modelName: modelName,

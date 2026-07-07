@@ -14,6 +14,7 @@ struct MenuBarView: View {
     @ObservedObject private var modeManager = ModeManager.shared
     @ObservedObject var audioDeviceManager = AudioDeviceManager.shared
     @ObservedObject private var dictationLanguageManager = DictationLanguageManager.shared
+    @ObservedObject private var stylePresetManager = StylePresetManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
     
@@ -129,6 +130,24 @@ struct MenuBarView: View {
                     Image(systemName: "globe")
                         .font(.system(size: 11, weight: .medium))
                     Text(String(format: String(localized: "Language: %@"), dictationLanguageManager.displayName))
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10))
+                }
+            }
+
+            Menu {
+                ForEach(StylePreset.allCases) { preset in
+                    Button {
+                        stylePresetManager.activePreset = preset
+                    } label: {
+                        Text(stylePresetManager.activePreset == preset ? "\(preset.displayName)  ✓" : preset.displayName)
+                    }
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "wand.and.stars")
+                        .font(.system(size: 11, weight: .medium))
+                    Text(String(format: String(localized: "Style: %@"), stylePresetManager.activePreset.displayName))
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 10))
                 }

@@ -103,6 +103,15 @@ struct SettingsView: View {
                         .controlSize(.small)
                 }
 
+                LabeledContent("Cycle Dictation Style") {
+                    ShortcutRecorder(action: .cycleDictationStyle) {
+                        recordingShortcutManager.updateShortcutStatus()
+                    }
+                        .controlSize(.small)
+                }
+
+                Toggle("Double-tap Fn (Globe key) to start / stop dictation", isOn: $recordingShortcutManager.isFnDoubleTapEnabled)
+
                 LabeledContent("Cancel Recording") {
                     HStack(spacing: 8) {
                         ShortcutRecorder(

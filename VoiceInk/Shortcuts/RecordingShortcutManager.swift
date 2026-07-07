@@ -40,12 +40,19 @@ class RecordingShortcutManager: ObservableObject {
             UserDefaults.standard.set(middleClickActivationDelay, forKey: "middleClickActivationDelay")
         }
     }
+    @Published var isFnDoubleTapEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isFnDoubleTapEnabled, forKey: "isFnDoubleTapEnabled")
+            refreshShortcutMonitoring()
+        }
+    }
     
     private var engine: VoiceInkEngine
     private var recorderUIManager: RecorderUIManager
     private var recorderPanelShortcutManager: RecorderPanelShortcutManager
     private let modeShortcutManager: ModeShortcutManager
     private let shortcutMonitor = ShortcutMonitor()
+    private let fnDoubleTapMonitor = FnDoubleTapMonitor()
     private var shortcutChangeObserver: NSObjectProtocol?
     private let shortcutModeHandler: RecordingShortcutModeHandler
     private let primaryRecordingShortcutModeSource: RecordingShortcutModeSource
@@ -113,6 +120,7 @@ class RecordingShortcutManager: ObservableObject {
 
         self.isMiddleClickToggleEnabled = UserDefaults.standard.bool(forKey: "isMiddleClickToggleEnabled")
         self.middleClickActivationDelay = UserDefaults.standard.integer(forKey: "middleClickActivationDelay")
+        self.isFnDoubleTapEnabled = (UserDefaults.standard.object(forKey: "isFnDoubleTapEnabled") as? Bool) ?? true
 
         let shortcutModeHandler = RecordingShortcutModeHandler(
             canHandleShortcutAction: {
@@ -169,6 +177,17 @@ class RecordingShortcutManager: ObservableObject {
         
         refreshShortcutMonitor()
         setupMiddleClickMonitoring()
+        setupFnDoubleTapMonitoring()
+    }
+
+    private func setupFnDoubleTapMonitoring() {
+        guard isFnDoubleTapEnabled else { return }
+        fnDoubleTapMonitor.start { [weak self] in
+            guard let self, self.canHandleShortcutAction else { return }
+            Task { @MainActor in
+                await self.recorderUIManager.toggleRecorderPanel()
+            }
+        }
     }
     
     private func setupMiddleClickMonitoring() {
@@ -291,6 +310,8 @@ class RecordingShortcutManager: ObservableObject {
             DictionaryQuickAddManager.shared.toggle(modelContainer: engine.modelContext.container)
         case .toggleDictationLanguage:
             DictationLanguageManager.shared.toggleEnglishSpanish()
+        case .cycleDictationStyle:
+            StylePresetManager.shared.cycle()
         default:
             break
         }
@@ -298,6 +319,7 @@ class RecordingShortcutManager: ObservableObject {
 
     private func removeAllMonitoring() {
         shortcutMonitor.stop()
+        fnDoubleTapMonitor.stop()
         
         for monitor in middleClickMonitors {
             if let monitor = monitor {

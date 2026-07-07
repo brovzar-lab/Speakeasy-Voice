@@ -97,6 +97,9 @@ struct VoiceInkApp: App {
         // Route dictation through the local Ollama cleanup model on first launch.
         Self.seedOllamaCleanupIfNeeded(enhancementService: enhancementService, aiService: aiService)
 
+        // Seed the style-preset cleanup prompts (Clean / Email / Script Notes / Casual).
+        Self.seedStylePresetsIfNeeded(enhancementService: enhancementService)
+
         // 1. Create modelsDirectory URL
         let appSupportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("com.prakashjoshipax.VoiceInk")
@@ -332,6 +335,37 @@ struct VoiceInkApp: App {
             // unset so this retries on a later launch once a mode has been created.
             logger.warning("⚠️ No mode configuration found yet; will retry Ollama cleanup setup on next launch")
         }
+    }
+
+    /// Ensure the enhancement prompts used by the style presets exist (built-ins plus a
+    /// custom "Script Notes" prompt), so cycling styles always resolves to a real prompt.
+    private static func seedStylePresetsIfNeeded(enhancementService: AIEnhancementService) {
+        let key = "hasSeededStylePresets_v1"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+
+        var prompts = enhancementService.customPrompts
+        for id in [PromptTemplates.defaultPromptId, PromptTemplates.emailPromptId, PromptTemplates.chatPromptId]
+        where !prompts.contains(where: { $0.id == id }) {
+            if let seed = PromptTemplates.seedPrompts.first(where: { $0.id == id }) {
+                prompts.append(seed)
+            }
+        }
+        if !prompts.contains(where: { $0.id == StylePresetManager.scriptNotesPromptId }) {
+            prompts.append(CustomPrompt(
+                id: StylePresetManager.scriptNotesPromptId,
+                title: "Script Notes",
+                promptText: """
+                    Turn the dictated speech in <USER_MESSAGE> into concise production and script notes.
+
+                    # Rules
+                    - Keep it terse and skimmable. Prefer short bullet points for beats, action items, and notes.
+                    - Preserve names, character names, scene numbers, and industry terms exactly.
+                    - Do not add commentary, greetings, or invented details.
+                    """,
+                useSystemInstructions: true))
+        }
+        enhancementService.customPrompts = prompts
+        UserDefaults.standard.set(true, forKey: key)
     }
 
     private static func createInMemoryContainer(schema: Schema, logger: Logger) throws -> ModelContainer {
