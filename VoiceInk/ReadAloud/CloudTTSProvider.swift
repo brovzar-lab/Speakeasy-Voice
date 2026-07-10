@@ -41,10 +41,14 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     private var progressTimer: Timer?
     private var streamingEngine: AVAudioEngine?
     private var streamingNode: AVAudioPlayerNode?
+    /// Varispeed unit between the player node and mixer — required for reliable
+    /// PCM rate control. `AVAudioPlayerNode.rate` is ignored on many macOS builds.
+    private var streamingVarispeed: AVAudioUnitVarispeed?
     private var streamingFormat: AVAudioFormat?
     private var streamingTask: Task<Void, Never>?
     private var pendingStreamingBuffers = 0
     private var streamEnded = false
+    private var currentPCMRate: Float = 1.0
     var onProgress: ((Double) -> Void)?
 
     var isPlaying: Bool {
@@ -101,37 +105,12 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     ) async where S.Element == UInt8 {
         stop()
 
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: true
-        ) else {
+        guard setupPCMEngine(sampleRate: sampleRate, volume: volume, initialRate: initialRate) else {
             resolveContinuation()
             return
         }
 
-        let engine = AVAudioEngine()
-        let node = AVAudioPlayerNode()
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
-        engine.mainMixerNode.outputVolume = max(0.0, min(1.0, volume))
-        node.volume = max(0.0, min(1.0, volume))
-
-        do {
-            try engine.start()
-        } catch {
-            resolveContinuation()
-            return
-        }
-
-        streamingEngine = engine
-        streamingNode = node
-        streamingFormat = format
-        streamEnded = false
-        pendingStreamingBuffers = 0
-
-        node.play()
+        streamingNode?.play()
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             self.continuation = cont
@@ -139,7 +118,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             self.streamingTask = Task { @MainActor in
                 var pending = Data()
                 let bytesPerFrame = 2
-                // ~250ms of audio at 16 kHz before we kick off playback.
+                // ~250ms of audio before we kick off playback.
                 let startupThreshold = Int(sampleRate) * bytesPerFrame / 4
                 var didStartPlayback = false
 
@@ -158,7 +137,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         if shouldFlush {
                             let chunk = pending.prefix(alignedCount)
                             pending.removeFirst(alignedCount)
-                            self.scheduleStreamingPCMBuffer(Data(chunk), rate: initialRate)
+                            self.scheduleStreamingPCMBuffer(Data(chunk))
                             didStartPlayback = true
                         }
                     }
@@ -166,7 +145,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                     if !pending.isEmpty {
                         let alignedCount = pending.count - (pending.count % bytesPerFrame)
                         if alignedCount > 0 {
-                            self.scheduleStreamingPCMBuffer(Data(pending.prefix(alignedCount)), rate: initialRate)
+                            self.scheduleStreamingPCMBuffer(Data(pending.prefix(alignedCount)))
                         }
                     }
 
@@ -185,34 +164,10 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     func play(pcmData: Data, sampleRate: Double, volume: Float, initialRate: Float = 1.0) async {
         stop()
 
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: true
-        ) else {
+        guard setupPCMEngine(sampleRate: sampleRate, volume: volume, initialRate: initialRate) else {
             resolveContinuation()
             return
         }
-
-        let engine = AVAudioEngine()
-        let node = AVAudioPlayerNode()
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
-        engine.mainMixerNode.outputVolume = max(0.0, min(1.0, volume))
-
-        do {
-            try engine.start()
-        } catch {
-            resolveContinuation()
-            return
-        }
-
-        streamingEngine = engine
-        streamingNode = node
-        streamingFormat = format
-        streamEnded = false
-        pendingStreamingBuffers = 0
 
         let alignedCount = pcmData.count - (pcmData.count % 2)
         guard alignedCount > 0 else {
@@ -220,9 +175,9 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             return
         }
 
-        scheduleStreamingPCMBuffer(Data(pcmData.prefix(alignedCount)), rate: initialRate)
+        scheduleStreamingPCMBuffer(Data(pcmData.prefix(alignedCount)))
         streamEnded = true
-        node.play()
+        streamingNode?.play()
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             self.continuation = cont
@@ -242,13 +197,16 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         streamingNode?.play()
     }
 
-    /// Change playback speed of the currently-loaded mp3 in place.
+    /// Change playback speed of the currently-loaded audio in place.
     /// No-op when idle.
     func setRate(_ rate: Float) {
         let clamped = max(0.5, min(2.0, rate))
+        currentPCMRate = clamped
         if let player {
             player.rate = clamped
         }
+        // Varispeed is the reliable path for PCM (Gemini / ElevenLabs streaming).
+        streamingVarispeed?.rate = clamped
         streamingNode?.rate = clamped
     }
 
@@ -259,11 +217,19 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         streamingTask = nil
         streamingNode?.stop()
         streamingEngine?.stop()
+        if let node = streamingNode {
+            streamingEngine?.detach(node)
+        }
+        if let varispeed = streamingVarispeed {
+            streamingEngine?.detach(varispeed)
+        }
         streamingNode = nil
+        streamingVarispeed = nil
         streamingEngine = nil
         streamingFormat = nil
         pendingStreamingBuffers = 0
         streamEnded = false
+        currentPCMRate = 1.0
         player?.stop()
         player = nil
         resolveContinuation()
@@ -277,7 +243,49 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         }
     }
 
-    private func scheduleStreamingPCMBuffer(_ data: Data, rate: Float) {
+    /// Wire `AVAudioPlayerNode` → `AVAudioUnitVarispeed` → mixer so rate changes
+    /// actually affect PCM playback (Gemini batch + streaming providers).
+    @discardableResult
+    private func setupPCMEngine(sampleRate: Double, volume: Float, initialRate: Float) -> Bool {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: true
+        ) else {
+            return false
+        }
+
+        let engine = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        let varispeed = AVAudioUnitVarispeed()
+        let clampedRate = max(0.5, min(2.0, initialRate))
+        varispeed.rate = clampedRate
+
+        engine.attach(node)
+        engine.attach(varispeed)
+        engine.connect(node, to: varispeed, format: format)
+        engine.connect(varispeed, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = max(0.0, min(1.0, volume))
+        node.volume = max(0.0, min(1.0, volume))
+
+        do {
+            try engine.start()
+        } catch {
+            return false
+        }
+
+        streamingEngine = engine
+        streamingNode = node
+        streamingVarispeed = varispeed
+        streamingFormat = format
+        streamEnded = false
+        pendingStreamingBuffers = 0
+        currentPCMRate = clampedRate
+        return true
+    }
+
+    private func scheduleStreamingPCMBuffer(_ data: Data) {
         guard let format = streamingFormat, let node = streamingNode else { return }
 
         let frameCount = AVAudioFrameCount(data.count / 2)
@@ -296,7 +304,8 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         }
 
         pendingStreamingBuffers += 1
-        node.rate = max(0.5, min(2.0, rate))
+        // Keep varispeed rate applied in case it was changed mid-stream.
+        streamingVarispeed?.rate = currentPCMRate
         node.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -312,7 +321,14 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         streamingTask = nil
         streamingNode?.stop()
         streamingEngine?.stop()
+        if let node = streamingNode {
+            streamingEngine?.detach(node)
+        }
+        if let varispeed = streamingVarispeed {
+            streamingEngine?.detach(varispeed)
+        }
         streamingNode = nil
+        streamingVarispeed = nil
         streamingEngine = nil
         streamingFormat = nil
         resolveContinuation()
