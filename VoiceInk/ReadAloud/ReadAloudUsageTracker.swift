@@ -10,7 +10,7 @@ import OSLog
 struct ReadAloudUsageRecord: Codable, Identifiable, Hashable {
     let id: UUID
     let timestamp: Date
-    /// One of `"apple"`, `"elevenlabs"`, `"openai"` (matches `ReadAloudProvider.rawValue`).
+    /// One of `"apple"`, `"elevenlabs"`, `"openai"`, `"gemini"` (matches `ReadAloudProvider.rawValue`).
     let provider: String
     /// Provider-specific model id (e.g. `"eleven_turbo_v2_5"`, `"tts-1"`).
     let model: String
@@ -124,6 +124,19 @@ final class ReadAloudUsageTracker: ObservableObject {
             // tts-1 and gpt-4o-mini-tts approx → $15 / 1M chars.
             // gpt-4o-mini-tts is actually token-priced but ~equivalent at this granularity.
             return Double(characterCount) / 1_000_000.0 * 15.0
+        case "gemini":
+            // Token-based pricing (2026-07): audio = 25 tokens/sec; ~12 chars/sec speech.
+            let inputTokens = Double(characterCount) / 4.0
+            let speechSeconds = Double(characterCount) / 12.0
+            let audioTokens = speechSeconds * 25.0
+            if m.contains("pro") {
+                return inputTokens / 1_000_000.0 * 1.0 + audioTokens / 1_000_000.0 * 20.0
+            }
+            if m.contains("3.1") {
+                return inputTokens / 1_000_000.0 * 1.0 + audioTokens / 1_000_000.0 * 20.0
+            }
+            // 2.5 Flash default
+            return inputTokens / 1_000_000.0 * 0.5 + audioTokens / 1_000_000.0 * 10.0
         default:
             return 0
         }
@@ -136,6 +149,8 @@ final class ReadAloudUsageTracker: ObservableObject {
     OpenAI tts-1: $0.015 / 1K chars
     OpenAI tts-1-hd: $0.030 / 1K chars
     OpenAI gpt-4o-mini-tts: ~$0.015 / 1K chars (token-priced, approx)
+    Gemini 2.5 Flash TTS: ~$0.008–0.015 / 1K chars (token-priced, approx)
+    Gemini 3.1 Flash TTS: ~$0.015–0.025 / 1K chars (token-priced, approx)
     Apple (local): free
     """
 

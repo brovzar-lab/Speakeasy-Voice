@@ -6,6 +6,7 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
     case apple
     case elevenlabs
     case openai
+    case gemini
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
         case .apple:      return String(localized: "Apple (Local)")
         case .elevenlabs: return String(localized: "ElevenLabs")
         case .openai:     return String(localized: "OpenAI TTS")
+        case .gemini:     return String(localized: "Gemini TTS")
         }
     }
 }
@@ -33,6 +35,8 @@ final class ReadAloudSettings: ObservableObject {
         static let elevenLabsModelId = "readAloud.elevenLabsModelId"
         static let openAIVoice = "readAloud.openAIVoice"
         static let openAIModel = "readAloud.openAIModel"
+        static let geminiVoice = "readAloud.geminiVoice"
+        static let geminiModel = "readAloud.geminiModel"
         static let rate = "readAloud.rate"
         static let pitch = "readAloud.pitch"
     }
@@ -67,6 +71,14 @@ final class ReadAloudSettings: ObservableObject {
         didSet { UserDefaults.standard.set(openAIModel, forKey: Keys.openAIModel) }
     }
 
+    @Published var geminiVoice: String {
+        didSet { UserDefaults.standard.set(geminiVoice, forKey: Keys.geminiVoice) }
+    }
+
+    @Published var geminiModel: String {
+        didSet { UserDefaults.standard.set(geminiModel, forKey: Keys.geminiModel) }
+    }
+
     /// Playback rate. 1.0 = natural speed. Each provider clamps to its own range.
     @Published var rate: Float {
         didSet { UserDefaults.standard.set(rate, forKey: Keys.rate) }
@@ -93,6 +105,9 @@ final class ReadAloudSettings: ObservableObject {
         self.elevenLabsModelId = resolvedElevenLabsModel
         self.openAIVoice = defaults.string(forKey: Keys.openAIVoice) ?? "nova"
         self.openAIModel = defaults.string(forKey: Keys.openAIModel) ?? "tts-1"
+        self.geminiVoice = defaults.string(forKey: Keys.geminiVoice) ?? "Kore"
+        // 2.5 Flash is cheapest; 3.1 Flash supports streaming for faster time-to-audio.
+        self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.5-flash-preview-tts"
         let storedRate = defaults.object(forKey: Keys.rate) as? Float
         self.rate = storedRate ?? 1.0
         let storedPitch = defaults.object(forKey: Keys.pitch) as? Float
@@ -126,6 +141,19 @@ final class ReadAloudSettings: ObservableObject {
                 volume: 1.0,
                 languageCode: nil
             )
+        case .gemini:
+            return VoiceConfiguration(
+                voiceIdentifier: geminiVoice,
+                rate: rate,
+                pitch: 1.0,
+                volume: 1.0,
+                languageCode: nil
+            )
         }
+    }
+
+    /// Whether the selected Gemini model supports `streamGenerateContent` audio.
+    var geminiSupportsStreaming: Bool {
+        geminiModel.contains("3.1")
     }
 }

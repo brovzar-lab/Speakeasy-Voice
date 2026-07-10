@@ -58,6 +58,14 @@ final class ReadAloudManager: ObservableObject {
         return p
     }()
 
+    private lazy var geminiProvider: GeminiTTSProvider = {
+        let p = GeminiTTSProvider()
+        p.onProgressUpdate = { [weak self] value in
+            Task { @MainActor in self?.progress = value }
+        }
+        return p
+    }()
+
     private var currentProviderRef: TextToSpeechProvider?
     private var playbackTask: Task<Void, Never>?
     private lazy var indicatorWindow: ReadAloudIndicatorWindow = ReadAloudIndicatorWindow(manager: self)
@@ -253,6 +261,8 @@ final class ReadAloudManager: ObservableObject {
             provider = elevenLabsProvider
         case .openai:
             provider = openAIProvider
+        case .gemini:
+            provider = geminiProvider
         }
 
         currentProviderRef = provider

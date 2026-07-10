@@ -300,6 +300,7 @@ struct ReadAloudUsageWidget: View {
         case "apple": return String(localized: "Apple")
         case "elevenlabs": return String(localized: "ElevenLabs")
         case "openai": return String(localized: "OpenAI")
+        case "gemini": return String(localized: "Gemini")
         default: return provider.capitalized
         }
     }
@@ -308,6 +309,7 @@ struct ReadAloudUsageWidget: View {
         switch provider {
         case "elevenlabs": return Color(red: 0.36, green: 0.58, blue: 0.85)
         case "openai": return Color(red: 0.30, green: 0.72, blue: 0.55)
+        case "gemini": return Color(red: 0.26, green: 0.52, blue: 0.96)
         case "apple": return Color.gray.opacity(0.6)
         default: return Color.accentColor
         }

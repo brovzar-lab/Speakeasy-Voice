@@ -93,12 +93,12 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     /// Stream 16-bit mono PCM and begin playback as soon as the first chunk arrives.
-    func playStreamingPCM(
-        from stream: URLSession.AsyncBytes,
+    func playStreamingPCM<S: AsyncSequence>(
+        from stream: S,
         sampleRate: Double,
         volume: Float,
         initialRate: Float = 1.0
-    ) async {
+    ) async where S.Element == UInt8 {
         stop()
 
         guard let format = AVAudioFormat(
@@ -177,6 +177,57 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                 } catch {
                     self.finishStreamingPlayback()
                 }
+            }
+        }
+    }
+
+    /// Play a complete 16-bit mono PCM buffer (used by Gemini batch responses).
+    func play(pcmData: Data, sampleRate: Double, volume: Float, initialRate: Float = 1.0) async {
+        stop()
+
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: true
+        ) else {
+            resolveContinuation()
+            return
+        }
+
+        let engine = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = max(0.0, min(1.0, volume))
+
+        do {
+            try engine.start()
+        } catch {
+            resolveContinuation()
+            return
+        }
+
+        streamingEngine = engine
+        streamingNode = node
+        streamingFormat = format
+        streamEnded = false
+        pendingStreamingBuffers = 0
+
+        let alignedCount = pcmData.count - (pcmData.count % 2)
+        guard alignedCount > 0 else {
+            resolveContinuation()
+            return
+        }
+
+        scheduleStreamingPCMBuffer(Data(pcmData.prefix(alignedCount)), rate: initialRate)
+        streamEnded = true
+        node.play()
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            self.continuation = cont
+            if self.pendingStreamingBuffers == 0 {
+                self.finishStreamingPlayback()
             }
         }
     }
@@ -524,5 +575,296 @@ final class OpenAITTSProvider: TextToSpeechProvider {
             let body = String(data: data, encoding: .utf8)
             throw CloudTTSError.httpError(http.statusCode, body)
         }
+    }
+}
+
+// MARK: - Gemini
+
+/// Text-to-speech via the Gemini `generateContent` / `streamGenerateContent` APIs.
+///
+/// Returns 24 kHz 16-bit mono PCM. Gemini 3.1 Flash supports streaming so playback
+/// can start before the full response arrives; 2.5 Flash uses batch generateContent.
+@MainActor
+final class GeminiTTSProvider: TextToSpeechProvider {
+    static let pcmSampleRate: Double = 24_000
+
+    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "ReadAloud.Gemini")
+    private let audioPlayer = CloudTTSPlayer()
+
+    var onProgressUpdate: ((Double) -> Void)? {
+        get { audioPlayer.onProgress }
+        set { audioPlayer.onProgress = newValue }
+    }
+
+    var isSpeaking: Bool { audioPlayer.isPlaying }
+    var isPaused: Bool { audioPlayer.isPaused }
+
+    func speak(_ text: String, voice: VoiceConfiguration) async throws {
+        stop()
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard let apiKey = APIKeyManager.shared.getAPIKey(forProvider: "gemini"),
+              !apiKey.isEmpty else {
+            throw CloudTTSError.missingAPIKey("Gemini")
+        }
+
+        let model = ReadAloudSettings.shared.geminiModel
+        let voiceName = voice.voiceIdentifier ?? "Kore"
+        let bodyData = try Self.makeRequestBody(text: trimmed, voiceName: voiceName)
+
+        let settings = ReadAloudSettings.shared
+        if settings.geminiSupportsStreaming {
+            do {
+                try await speakWithStreaming(
+                    model: model,
+                    bodyData: bodyData,
+                    apiKey: apiKey,
+                    trimmed: trimmed,
+                    voiceName: voiceName,
+                    voice: voice
+                )
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                logger.warning("Gemini streaming failed, falling back to batch: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
+        try await speakWithBatch(
+            model: model,
+            bodyData: bodyData,
+            apiKey: apiKey,
+            trimmed: trimmed,
+            voiceName: voiceName,
+            voice: voice
+        )
+    }
+
+    func pause() { audioPlayer.pause() }
+    func resume() { audioPlayer.resume() }
+    func stop() { audioPlayer.stop() }
+    func setLiveRate(_ rate: Float) { audioPlayer.setRate(rate) }
+
+    private static func makeRequestBody(text: String, voiceName: String) throws -> Data {
+        let body: [String: Any] = [
+            "contents": [
+                ["parts": [["text": text]]]
+            ],
+            "generationConfig": [
+                "responseModalities": ["AUDIO"],
+                "speechConfig": [
+                    "voiceConfig": [
+                        "prebuiltVoiceConfig": [
+                            "voiceName": voiceName
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    private func speakWithBatch(
+        model: String,
+        bodyData: Data,
+        apiKey: String,
+        trimmed: String,
+        voiceName: String,
+        voice: VoiceConfiguration
+    ) async throws {
+        var request = URLRequest(
+            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
+        )
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = bodyData
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.checkHTTPStatus(response: response, data: data)
+
+        try Task.checkCancellation()
+        guard let pcm = Self.extractPCM(from: data) else {
+            throw CloudTTSError.decodingFailed
+        }
+
+        ReadAloudUsageTracker.shared.record(
+            provider: "gemini",
+            model: model,
+            voiceId: voiceName,
+            characterCount: trimmed.count
+        )
+
+        await audioPlayer.play(
+            pcmData: pcm,
+            sampleRate: Self.pcmSampleRate,
+            volume: voice.volume,
+            initialRate: voice.rate
+        )
+    }
+
+    private func speakWithStreaming(
+        model: String,
+        bodyData: Data,
+        apiKey: String,
+        trimmed: String,
+        voiceName: String,
+        voice: VoiceConfiguration
+    ) async throws {
+        var request = URLRequest(
+            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent")!
+        )
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = bodyData
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CloudTTSError.invalidResponse
+        }
+        if !(200..<300).contains(http.statusCode) {
+            var errorData = Data()
+            for try await byte in bytes {
+                errorData.append(byte)
+            }
+            let body = String(data: errorData, encoding: .utf8)
+            throw CloudTTSError.httpError(http.statusCode, body)
+        }
+
+        try Task.checkCancellation()
+        ReadAloudUsageTracker.shared.record(
+            provider: "gemini",
+            model: model,
+            voiceId: voiceName,
+            characterCount: trimmed.count
+        )
+
+        let pcmStream = GeminiPCMStreamDecoder(bytes: bytes)
+        await audioPlayer.playStreamingPCM(
+            from: pcmStream,
+            sampleRate: Self.pcmSampleRate,
+            volume: voice.volume,
+            initialRate: voice.rate
+        )
+    }
+
+    private static func extractPCM(from data: Data) -> Data? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let first = candidates.first,
+              let content = first["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]] else {
+            return nil
+        }
+
+        for part in parts {
+            if let inlineData = part["inlineData"] as? [String: Any],
+               let encoded = inlineData["data"] as? String,
+               let pcm = Data(base64Encoded: encoded) {
+                return pcm
+            }
+        }
+        return nil
+    }
+
+    private static func checkHTTPStatus(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw CloudTTSError.invalidResponse
+        }
+        if !(200..<300).contains(http.statusCode) {
+            let body = String(data: data, encoding: .utf8)
+            throw CloudTTSError.httpError(http.statusCode, body)
+        }
+    }
+}
+
+/// Decodes Gemini `streamGenerateContent` JSON chunks into a raw PCM byte stream.
+private struct GeminiPCMStreamDecoder: AsyncSequence {
+    typealias Element = UInt8
+
+    private let bytes: URLSession.AsyncBytes
+    private let inlineDataRegex: NSRegularExpression
+
+    init(bytes: URLSession.AsyncBytes) {
+        self.bytes = bytes
+        self.inlineDataRegex = try! NSRegularExpression(
+            pattern: #""inlineData"\s*:\s*\{\s*"(?:mimeType|mime_type)"\s*:\s*"[^"]*"\s*,\s*"data"\s*:\s*"([A-Za-z0-9+/=]+)""#
+        )
+    }
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        private let inlineDataRegex: NSRegularExpression
+        private var textBuffer = ""
+        private var emittedHashes = Set<Int>()
+        private var pendingPCM = Data()
+        private var pendingIndex = 0
+        private var finished = false
+        private var byteIterator: URLSession.AsyncBytes.AsyncIterator
+
+        init(bytes: URLSession.AsyncBytes, inlineDataRegex: NSRegularExpression) {
+            self.inlineDataRegex = inlineDataRegex
+            self.byteIterator = bytes.makeAsyncIterator()
+        }
+
+        mutating func next() async throws -> UInt8? {
+            while true {
+                if pendingIndex < pendingPCM.count {
+                    let byte = pendingPCM[pendingIndex]
+                    pendingIndex += 1
+                    return byte
+                }
+
+                pendingPCM.removeAll(keepingCapacity: true)
+                pendingIndex = 0
+
+                if finished {
+                    return nil
+                }
+
+                var didRead = false
+                while let byte = try await byteIterator.next() {
+                    didRead = true
+                    textBuffer.append(Character(UnicodeScalar(byte)))
+                    extractNewPCMChunks()
+                    if !pendingPCM.isEmpty {
+                        break
+                    }
+                }
+
+                if !didRead {
+                    finished = true
+                    return nil
+                }
+            }
+        }
+
+        private mutating func extractNewPCMChunks() {
+            let nsRange = NSRange(textBuffer.startIndex..<textBuffer.endIndex, in: textBuffer)
+            let matches = inlineDataRegex.matches(in: textBuffer, range: nsRange)
+            for match in matches {
+                guard match.numberOfRanges > 1,
+                      let dataRange = Range(match.range(at: 1), in: textBuffer) else {
+                    continue
+                }
+                let encoded = String(textBuffer[dataRange])
+                let hash = encoded.hashValue
+                guard !emittedHashes.contains(hash),
+                      let chunk = Data(base64Encoded: encoded) else {
+                    continue
+                }
+                emittedHashes.insert(hash)
+                pendingPCM.append(chunk)
+            }
+        }
+    }
+
+    func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(bytes: bytes, inlineDataRegex: inlineDataRegex)
     }
 }

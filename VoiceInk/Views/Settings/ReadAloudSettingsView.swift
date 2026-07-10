@@ -11,10 +11,12 @@ struct ReadAloudSettingsView: View {
     @State private var voiceCatalog: AppleVoiceCatalog = .load()
     @State private var elevenLabsAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "elevenlabs") ?? ""
     @State private var openAIAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "openai") ?? ""
+    @State private var geminiAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "gemini") ?? ""
     @State private var sampleText: String = String(localized: "The quick brown fox jumps over the lazy dog. This is what the selected voice sounds like.")
 
     @State private var openAIKeyStatus: KeyStatus = .unknown
     @State private var elevenLabsKeyStatus: KeyStatus = .unknown
+    @State private var geminiKeyStatus: KeyStatus = .unknown
 
     enum KeyStatus {
         case unknown, testing, ok, failed(String)
@@ -55,6 +57,8 @@ struct ReadAloudSettingsView: View {
                 elevenLabsSection
             case .openai:
                 openAISection
+            case .gemini:
+                geminiSection
             }
 
             Section {
@@ -89,6 +93,7 @@ struct ReadAloudSettingsView: View {
             voiceCatalog = AppleVoiceCatalog.load()
             elevenLabsAPIKey = APIKeyManager.shared.getAPIKey(forProvider: "elevenlabs") ?? ""
             openAIAPIKey = APIKeyManager.shared.getAPIKey(forProvider: "openai") ?? ""
+            geminiAPIKey = APIKeyManager.shared.getAPIKey(forProvider: "gemini") ?? ""
             reconcileOpenAIVoice()
         }
         .onChange(of: settings.openAIModel) { _, _ in
@@ -245,6 +250,56 @@ struct ReadAloudSettingsView: View {
         }
     }
 
+    // MARK: - Gemini
+
+    private var geminiSection: some View {
+        Section {
+            HStack {
+                SecureField("API Key", text: $geminiAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") {
+                    APIKeyManager.shared.saveAPIKey(geminiAPIKey, forProvider: "gemini")
+                    geminiKeyStatus = .unknown
+                }
+                .disabled(geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Test") {
+                    Task { await testGeminiKey() }
+                }
+                .disabled(geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            keyStatusRow(geminiKeyStatus)
+
+            Picker("Model", selection: $settings.geminiModel) {
+                Text("2.5 Flash (cheapest)").tag("gemini-2.5-flash-preview-tts")
+                Text("3.1 Flash (fastest — streaming)").tag("gemini-3.1-flash-tts-preview")
+                Text("2.5 Pro (highest quality)").tag("gemini-2.5-pro-preview-tts")
+            }
+            .pickerStyle(.menu)
+
+            Picker("Voice", selection: $settings.geminiVoice) {
+                ForEach(GeminiTTSVoices.all) { voice in
+                    Text(voice.displayName).tag(voice.id)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Button {
+                if let url = URL(string: "https://aistudio.google.com/app/apikey") {
+                    NSWorkspace.shared.open(url)
+                }
+            } label: {
+                Label("Get API Key at Google AI Studio", systemImage: "safari")
+            }
+        } header: {
+            Text("Gemini TTS")
+        } footer: {
+            Text("Uses the same Gemini API key as AI Models and transcription. Gemini 2.5 Flash is the cheapest cloud option; 3.1 Flash streams audio for faster playback. 70+ languages auto-detected from your text.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     /// If the saved voice isn't compatible with the saved model, pick the first
     /// supported voice for that model. Prevents 400 errors from stale combos
     /// like "Ballad + tts-1-hd" carried over from earlier releases.
@@ -339,6 +394,36 @@ struct ReadAloudSettingsView: View {
             elevenLabsKeyStatus = .failed(error.localizedDescription)
         }
     }
+
+    private func testGeminiKey() async {
+        geminiKeyStatus = .testing
+        let key = geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        APIKeyManager.shared.saveAPIKey(key, forProvider: "gemini")
+
+        var request = URLRequest(
+            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models")!
+        )
+        request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        request.timeoutInterval = 15
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                geminiKeyStatus = .failed(String(localized: "Unexpected response"))
+                return
+            }
+            switch http.statusCode {
+            case 200..<300:
+                geminiKeyStatus = .ok
+            case 401, 403:
+                geminiKeyStatus = .failed(String(localized: "401/403 — key is invalid or lacks permissions"))
+            default:
+                geminiKeyStatus = .failed(String(format: String(localized: "HTTP %d"), http.statusCode))
+            }
+        } catch {
+            geminiKeyStatus = .failed(error.localizedDescription)
+        }
+    }
 }
 
 // MARK: - OpenAI voice/model compatibility
@@ -380,4 +465,46 @@ enum OpenAITTSVoices {
     static func supportedVoiceIds(for model: String) -> [String] {
         voices(for: model).map(\.id)
     }
+}
+
+// MARK: - Gemini voice catalog
+
+enum GeminiTTSVoices {
+    struct Voice: Identifiable, Hashable {
+        let id: String
+        let displayName: String
+    }
+
+    static let all: [Voice] = [
+        Voice(id: "Zephyr", displayName: "Zephyr (Bright)"),
+        Voice(id: "Puck", displayName: "Puck (Upbeat)"),
+        Voice(id: "Charon", displayName: "Charon (Informative)"),
+        Voice(id: "Kore", displayName: "Kore (Firm)"),
+        Voice(id: "Fenrir", displayName: "Fenrir (Excitable)"),
+        Voice(id: "Leda", displayName: "Leda (Youthful)"),
+        Voice(id: "Orus", displayName: "Orus (Firm)"),
+        Voice(id: "Aoede", displayName: "Aoede (Breezy)"),
+        Voice(id: "Callirrhoe", displayName: "Callirrhoe (Easy-going)"),
+        Voice(id: "Autonoe", displayName: "Autonoe (Bright)"),
+        Voice(id: "Enceladus", displayName: "Enceladus (Breathy)"),
+        Voice(id: "Iapetus", displayName: "Iapetus (Clear)"),
+        Voice(id: "Umbriel", displayName: "Umbriel (Easy-going)"),
+        Voice(id: "Algieba", displayName: "Algieba (Smooth)"),
+        Voice(id: "Despina", displayName: "Despina (Smooth)"),
+        Voice(id: "Erinome", displayName: "Erinome (Clear)"),
+        Voice(id: "Algenib", displayName: "Algenib (Gravelly)"),
+        Voice(id: "Rasalgethi", displayName: "Rasalgethi (Informative)"),
+        Voice(id: "Laomedeia", displayName: "Laomedeia (Upbeat)"),
+        Voice(id: "Achernar", displayName: "Achernar (Soft)"),
+        Voice(id: "Alnilam", displayName: "Alnilam (Firm)"),
+        Voice(id: "Schedar", displayName: "Schedar (Even)"),
+        Voice(id: "Gacrux", displayName: "Gacrux (Mature)"),
+        Voice(id: "Pulcherrima", displayName: "Pulcherrima (Forward)"),
+        Voice(id: "Achird", displayName: "Achird (Friendly)"),
+        Voice(id: "Zubenelgenubi", displayName: "Zubenelgenubi (Casual)"),
+        Voice(id: "Vindemiatrix", displayName: "Vindemiatrix (Gentle)"),
+        Voice(id: "Sadachbia", displayName: "Sadachbia (Lively)"),
+        Voice(id: "Sadaltager", displayName: "Sadaltager (Knowledgeable)"),
+        Voice(id: "Sulafat", displayName: "Sulafat (Warm)")
+    ]
 }
