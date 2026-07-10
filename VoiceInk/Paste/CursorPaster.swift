@@ -45,6 +45,16 @@ class CursorPaster {
 
     @MainActor
     private static func performPasteSession(_ text: String) async -> PasteResult {
+        let method = PasteMethod.current()
+
+        // Direct-typing path: no clipboard touch, no snapshot, no restore.
+        // Every character is synthesized via CGEvent's Unicode key event, so
+        // clipboard managers never see the transcript at all.
+        guard method.usesClipboard else {
+            await wait(prePasteDelay)
+            return await pasteByTyping(text)
+        }
+
         let pasteboard = NSPasteboard.general
         let shouldRestoreClipboard = UserDefaults.standard.bool(forKey: "restoreClipboardAfterPaste")
         let savedContents = shouldRestoreClipboard ? snapshotClipboard(from: pasteboard) : []
@@ -203,6 +213,61 @@ class CursorPaster {
         vUp.post(tap: .cghidEventTap)
         await wait(pasteShortcutEventDelay)
         cmdUp.post(tap: .cghidEventTap)
+
+        return .commandPosted
+    }
+
+    // MARK: - Direct typing (clipboard-free)
+
+    /// Types `text` character-by-character via `CGEventKeyboardSetUnicodeString`.
+    ///
+    /// The pasteboard is never touched — clipboard managers see nothing. We
+    /// chunk the UTF-16 code units into small groups because `CGEvent` limits
+    /// how many characters fit in a single Unicode key event (roughly 20 UTF-16
+    /// units in practice). A short wait between chunks lets slow apps
+    /// (Electron, some browsers) keep up without dropping characters.
+    @MainActor
+    private static func pasteByTyping(_ text: String) async -> PasteResult {
+        guard AXIsProcessTrusted() else {
+            logger.error("Accessibility permission is required to type text directly")
+            return .commandNotPosted
+        }
+        guard !text.isEmpty else { return .commandPosted }
+        guard let source = CGEventSource(stateID: .privateState) else {
+            logger.error("Failed to create CGEventSource for direct typing")
+            return .commandNotPosted
+        }
+
+        let utf16Units = Array(text.utf16)
+        let chunkSize = 20
+        var index = 0
+
+        while index < utf16Units.count {
+            let end = min(index + chunkSize, utf16Units.count)
+            let chunk = Array(utf16Units[index..<end])
+
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                logger.error("Failed to create keyboard events for direct typing at chunk \(index)")
+                return .commandNotPosted
+            }
+
+            chunk.withUnsafeBufferPointer { buffer in
+                keyDown.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
+                keyUp.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
+            }
+
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+
+            index = end
+            if index < utf16Units.count {
+                // Slow apps drop events under sustained bursts; small pauses keep
+                // reliability high. 4ms per chunk = ~200 chars/sec — indistinguishable
+                // from paste for typical dictation lengths.
+                await wait(0.004)
+            }
+        }
 
         return .commandPosted
     }

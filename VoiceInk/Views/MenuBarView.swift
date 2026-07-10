@@ -15,6 +15,7 @@ struct MenuBarView: View {
     @ObservedObject var audioDeviceManager = AudioDeviceManager.shared
     @ObservedObject private var dictationLanguageManager = DictationLanguageManager.shared
     @ObservedObject private var stylePresetManager = StylePresetManager.shared
+    @ObservedObject private var readAloudManager = ReadAloudManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
     
@@ -151,6 +152,29 @@ struct MenuBarView: View {
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 10))
                 }
+            }
+
+            Divider()
+
+            if readAloudManager.state == .idle {
+                Button("Read Selected Text") {
+                    ReadAloudManager.shared.readSelectedText()
+                }
+
+                Button("Read Screen Region") {
+                    ReadAloudManager.shared.readScreenRegion()
+                }
+            } else {
+                Button(readAloudManager.state == .paused ? "Resume Reading" : "Pause Reading") {
+                    ReadAloudManager.shared.togglePlayback()
+                }
+                Button("Stop Reading") {
+                    ReadAloudManager.shared.stop()
+                }
+            }
+
+            Button("Read Aloud Settings…") {
+                menuBarManager.openMainWindowAndNavigate(to: "Read Aloud")
             }
 
             Divider()

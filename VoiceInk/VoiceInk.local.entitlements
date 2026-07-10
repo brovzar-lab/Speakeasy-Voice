@@ -4,6 +4,12 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<!-- Local builds sign with the self-signed "Speakeasy-Voice Local" identity while
+	     the project template forces hardened runtime on. Disable library validation so
+	     the SwiftPM debug dylib / frameworks load even if signed under a different team,
+	     which otherwise crashes the app at launch (DYLD "different Team IDs"). -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
 	<key>com.apple.security.automation.apple-events</key>
 	<true/>
 	<key>com.apple.security.device.audio-input</key>

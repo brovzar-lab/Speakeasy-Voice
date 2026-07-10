@@ -62,6 +62,7 @@ enum AppDefaults {
 
             // Model
             "PrewarmModelOnWake": true,
+            "KeepTranscriptionModelLoaded": true,
 
         ])
 

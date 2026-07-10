@@ -102,6 +102,34 @@ class OllamaService: ObservableObject {
         }
     }
 
+    /// Fire a tiny inference request to force Ollama to load the model into
+    /// memory. Ollama unloads models after a keep-alive timeout (default 5min)
+    /// — so on a cold launch, the very first real cleanup pays a 3-8 second
+    /// model-load penalty. Warming eliminates that penalty for the first
+    /// dictation of the session, which is when speed matters most.
+    ///
+    /// Uses a minimal 1-token prompt and short timeout. Failures are silent —
+    /// if Ollama isn't running, transcription still works, we just don't warm.
+    func warmupSelectedModel() async {
+        guard let url = baseURLValue else { return }
+        let modelName = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelName.isEmpty else { return }
+
+        do {
+            _ = try await OllamaClient.generate(
+                baseURL: url,
+                model: modelName,
+                prompt: ".",
+                systemPrompt: "Respond with a single period.",
+                temperature: 0,
+                think: false,
+                timeout: 30
+            )
+        } catch {
+            // Cold-launch warmup is best-effort. Log and move on.
+        }
+    }
+
     private func mapLLMKitError(_ error: LLMKitError) -> LocalAIError {
         switch error {
         case .invalidURL:

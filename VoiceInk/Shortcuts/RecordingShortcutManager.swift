@@ -312,6 +312,12 @@ class RecordingShortcutManager: ObservableObject {
             DictationLanguageManager.shared.toggleEnglishSpanish()
         case .cycleDictationStyle:
             StylePresetManager.shared.cycle()
+        case .readSelectedText:
+            ReadAloudManager.shared.readSelectedText()
+        case .readScreenRegion:
+            ReadAloudManager.shared.readScreenRegion()
+        case .stopReading:
+            ReadAloudManager.shared.stop()
         default:
             break
         }

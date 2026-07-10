@@ -501,7 +501,15 @@ class AIService: ObservableObject {
     func refreshOllamaAvailabilityInBackground() {
         Task { [weak self] in
             guard let self else { return }
-            await self.refreshOllamaAvailability()
+            let result = await self.refreshOllamaAvailability()
+            // Warm the selected model into memory so the first dictation of the
+            // session doesn't pay the 3-8s model-load penalty. Only worth doing
+            // if we actually reached Ollama and have a valid model selected.
+            if self.ollamaService.isConnected,
+               !result.models.isEmpty,
+               result.models.contains(where: { $0.name == self.ollamaService.selectedModel }) {
+                await self.ollamaService.warmupSelectedModel()
+            }
         }
     }
 

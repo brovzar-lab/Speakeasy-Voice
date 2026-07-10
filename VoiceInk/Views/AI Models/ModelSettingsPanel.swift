@@ -140,6 +140,7 @@ private struct AdvancedModelSettingsSection: View {
     @AppStorage("IsVADEnabled") private var isVADEnabled = true
     @AppStorage("AppendTrailingSpace") private var appendTrailingSpace = true
     @AppStorage("PrewarmModelOnWake") private var prewarmModelOnWake = true
+    @AppStorage("KeepTranscriptionModelLoaded") private var keepTranscriptionModelLoaded = true
 
     var body: some View {
         Section {
@@ -155,6 +156,14 @@ private struct AdvancedModelSettingsSection: View {
                 HStack(spacing: 4) {
                     Text("Voice Activity Detection (VAD)")
                     InfoTip("Detect speech segments and filter out silence to improve accuracy of local models.")
+                }
+            }
+            .toggleStyle(.switch)
+
+            Toggle(isOn: $keepTranscriptionModelLoaded) {
+                HStack(spacing: 4) {
+                    Text("Keep transcription model loaded")
+                    InfoTip("Leave Parakeet/Whisper in memory between dictations so the next recording starts faster. Turn off only if you need to free RAM for other apps.")
                 }
             }
             .toggleStyle(.switch)

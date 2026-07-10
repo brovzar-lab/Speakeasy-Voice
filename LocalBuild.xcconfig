@@ -2,11 +2,18 @@
 // Build configuration for local/unsigned builds (no Apple Developer certificate required).
 // Used by `make local` — does NOT affect Debug or Release configurations.
 
-// Ad-hoc signing (works without a developer account)
-CODE_SIGN_IDENTITY = -
+// Stable self-signed identity (created by scripts/create-local-signing-cert.sh).
+// Using a stable identity instead of ad-hoc (-) keeps the app's fingerprint the
+// same across rebuilds, so macOS Accessibility / Input Monitoring grants persist.
+CODE_SIGN_IDENTITY = Speakeasy-Voice Local
 CODE_SIGN_STYLE = Manual
 DEVELOPMENT_TEAM =
 PROVISIONING_PROFILE_SPECIFIER =
+
+// The project template forces hardened runtime on, which enforces library
+// validation. Because we sign with a self-signed identity (no team), the SwiftPM
+// debug dylib / frameworks can be rejected as "different Team IDs" and crash at
+// launch. VoiceInk.local.entitlements disables library validation to prevent that.
 
 // Entitlements are set via absolute path in the Makefile command line
 // (relative paths break SPM package targets that resolve from their own source root)
