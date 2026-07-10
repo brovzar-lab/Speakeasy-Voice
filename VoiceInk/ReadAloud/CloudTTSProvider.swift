@@ -49,6 +49,8 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     private var pendingStreamingBuffers = 0
     private var streamEnded = false
     private var currentPCMRate: Float = 1.0
+    /// Guards against double-resume of the playback continuation (crashes otherwise).
+    private var didResolveContinuation = false
     var onProgress: ((Double) -> Void)?
 
     var isPlaying: Bool {
@@ -73,6 +75,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     /// speed adjustment via `setRate(_:)` while the buffer is playing.
     func play(data: Data, volume: Float, initialRate: Float = 1.0) async {
         stop()
+        didResolveContinuation = false
 
         do {
             let p = try AVAudioPlayer(data: data)
@@ -104,6 +107,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         initialRate: Float = 1.0
     ) async where S.Element == UInt8 {
         stop()
+        didResolveContinuation = false
 
         guard setupPCMEngine(sampleRate: sampleRate, volume: volume, initialRate: initialRate) else {
             resolveContinuation()
@@ -160,31 +164,49 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         }
     }
 
-    /// Play a complete 16-bit mono PCM buffer (used by Gemini batch responses).
+    /// Play a complete 16-bit mono PCM buffer.
+    ///
+    /// Wraps the PCM in a WAV container and plays via `AVAudioPlayer` — same
+    /// path as OpenAI/ElevenLabs mp3 — so rate control works and we avoid
+    /// AVAudioEngine teardown races that were crashing the floating indicator.
     func play(pcmData: Data, sampleRate: Double, volume: Float, initialRate: Float = 1.0) async {
-        stop()
+        let wav = Self.makeWAV(pcmData: pcmData, sampleRate: Int(sampleRate))
+        await play(data: wav, volume: volume, initialRate: initialRate)
+    }
 
-        guard setupPCMEngine(sampleRate: sampleRate, volume: volume, initialRate: initialRate) else {
-            resolveContinuation()
-            return
+    /// Build a minimal WAV header around raw 16-bit mono PCM.
+    private static func makeWAV(pcmData: Data, sampleRate: Int, channels: Int = 1, bitsPerSample: Int = 16) -> Data {
+        let byteRate = sampleRate * channels * bitsPerSample / 8
+        let blockAlign = channels * bitsPerSample / 8
+        let dataSize = UInt32(pcmData.count)
+        var wav = Data()
+        wav.reserveCapacity(44 + pcmData.count)
+
+        func appendASCII(_ s: String) { wav.append(contentsOf: s.utf8) }
+        func appendUInt16(_ v: UInt16) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { wav.append(contentsOf: $0) }
+        }
+        func appendUInt32(_ v: UInt32) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { wav.append(contentsOf: $0) }
         }
 
-        let alignedCount = pcmData.count - (pcmData.count % 2)
-        guard alignedCount > 0 else {
-            resolveContinuation()
-            return
-        }
-
-        scheduleStreamingPCMBuffer(Data(pcmData.prefix(alignedCount)))
-        streamEnded = true
-        streamingNode?.play()
-
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            self.continuation = cont
-            if self.pendingStreamingBuffers == 0 {
-                self.finishStreamingPlayback()
-            }
-        }
+        appendASCII("RIFF")
+        appendUInt32(36 + dataSize)
+        appendASCII("WAVE")
+        appendASCII("fmt ")
+        appendUInt32(16)
+        appendUInt16(1) // PCM
+        appendUInt16(UInt16(channels))
+        appendUInt32(UInt32(sampleRate))
+        appendUInt32(UInt32(byteRate))
+        appendUInt16(UInt16(blockAlign))
+        appendUInt16(UInt16(bitsPerSample))
+        appendASCII("data")
+        appendUInt32(dataSize)
+        wav.append(pcmData)
+        return wav
     }
 
     func pause() {
@@ -205,7 +227,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         if let player {
             player.rate = clamped
         }
-        // Varispeed is the reliable path for PCM (Gemini / ElevenLabs streaming).
+        // Varispeed is the reliable path for streaming PCM (ElevenLabs / Gemini 3.1).
         streamingVarispeed?.rate = clamped
         streamingNode?.rate = clamped
     }
@@ -215,13 +237,11 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         progressTimer = nil
         streamingTask?.cancel()
         streamingTask = nil
+
+        // Stop playback first; do not detach nodes while callbacks may still fire.
         streamingNode?.stop()
-        streamingEngine?.stop()
-        if let node = streamingNode {
-            streamingEngine?.detach(node)
-        }
-        if let varispeed = streamingVarispeed {
-            streamingEngine?.detach(varispeed)
+        if let engine = streamingEngine, engine.isRunning {
+            engine.stop()
         }
         streamingNode = nil
         streamingVarispeed = nil
@@ -244,7 +264,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     /// Wire `AVAudioPlayerNode` → `AVAudioUnitVarispeed` → mixer so rate changes
-    /// actually affect PCM playback (Gemini batch + streaming providers).
+    /// actually affect streaming PCM playback.
     @discardableResult
     private func setupPCMEngine(sampleRate: Double, volume: Float, initialRate: Float) -> Bool {
         guard let format = AVAudioFormat(
@@ -304,7 +324,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         }
 
         pendingStreamingBuffers += 1
-        // Keep varispeed rate applied in case it was changed mid-stream.
         streamingVarispeed?.rate = currentPCMRate
         node.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
@@ -320,12 +339,8 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     private func finishStreamingPlayback() {
         streamingTask = nil
         streamingNode?.stop()
-        streamingEngine?.stop()
-        if let node = streamingNode {
-            streamingEngine?.detach(node)
-        }
-        if let varispeed = streamingVarispeed {
-            streamingEngine?.detach(varispeed)
+        if let engine = streamingEngine, engine.isRunning {
+            engine.stop()
         }
         streamingNode = nil
         streamingVarispeed = nil
@@ -347,6 +362,8 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     private func resolveContinuation() {
+        guard !didResolveContinuation else { return }
+        didResolveContinuation = true
         continuation?.resume()
         continuation = nil
     }
@@ -732,7 +749,7 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         voice: VoiceConfiguration
     ) async throws {
         var request = URLRequest(
-            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent")!
+            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse")!
         )
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
@@ -800,31 +817,28 @@ final class GeminiTTSProvider: TextToSpeechProvider {
     }
 }
 
-/// Decodes Gemini `streamGenerateContent` JSON chunks into a raw PCM byte stream.
+/// Decodes Gemini `streamGenerateContent?alt=sse` into a raw PCM byte stream.
+///
+/// Reads network bytes in bulk (not one-by-one into a String) and extracts
+/// base64 `inlineData.data` fields as soon as each SSE event arrives.
 private struct GeminiPCMStreamDecoder: AsyncSequence {
     typealias Element = UInt8
 
     private let bytes: URLSession.AsyncBytes
-    private let inlineDataRegex: NSRegularExpression
 
     init(bytes: URLSession.AsyncBytes) {
         self.bytes = bytes
-        self.inlineDataRegex = try! NSRegularExpression(
-            pattern: #""inlineData"\s*:\s*\{\s*"(?:mimeType|mime_type)"\s*:\s*"[^"]*"\s*,\s*"data"\s*:\s*"([A-Za-z0-9+/=]+)""#
-        )
     }
 
     struct AsyncIterator: AsyncIteratorProtocol {
-        private let inlineDataRegex: NSRegularExpression
-        private var textBuffer = ""
-        private var emittedHashes = Set<Int>()
+        private var byteIterator: URLSession.AsyncBytes.AsyncIterator
+        private var lineBuffer = Data()
         private var pendingPCM = Data()
         private var pendingIndex = 0
         private var finished = false
-        private var byteIterator: URLSession.AsyncBytes.AsyncIterator
+        private var emittedCount = 0
 
-        init(bytes: URLSession.AsyncBytes, inlineDataRegex: NSRegularExpression) {
-            self.inlineDataRegex = inlineDataRegex
+        init(bytes: URLSession.AsyncBytes) {
             self.byteIterator = bytes.makeAsyncIterator()
         }
 
@@ -843,44 +857,83 @@ private struct GeminiPCMStreamDecoder: AsyncSequence {
                     return nil
                 }
 
-                var didRead = false
-                while let byte = try await byteIterator.next() {
-                    didRead = true
-                    textBuffer.append(Character(UnicodeScalar(byte)))
-                    extractNewPCMChunks()
-                    if !pendingPCM.isEmpty {
-                        break
-                    }
+                // Pull a chunk of network bytes, then split on newlines for SSE.
+                var chunk = Data()
+                chunk.reserveCapacity(8_192)
+                while chunk.count < 8_192, let byte = try await byteIterator.next() {
+                    chunk.append(byte)
                 }
 
-                if !didRead {
+                if chunk.isEmpty {
+                    // Flush any trailing line.
+                    if !lineBuffer.isEmpty {
+                        extractPCM(fromSSELine: lineBuffer)
+                        lineBuffer.removeAll(keepingCapacity: true)
+                        if !pendingPCM.isEmpty {
+                            finished = true
+                            continue
+                        }
+                    }
                     finished = true
                     return nil
+                }
+
+                lineBuffer.append(chunk)
+                while let newline = lineBuffer.firstIndex(of: 0x0A) {
+                    let line = lineBuffer.subdata(in: lineBuffer.startIndex..<newline)
+                    let nextStart = lineBuffer.index(after: newline)
+                    lineBuffer.removeSubrange(lineBuffer.startIndex..<nextStart)
+                    extractPCM(fromSSELine: line)
+                }
+
+                if !pendingPCM.isEmpty {
+                    continue
                 }
             }
         }
 
-        private mutating func extractNewPCMChunks() {
-            let nsRange = NSRange(textBuffer.startIndex..<textBuffer.endIndex, in: textBuffer)
-            let matches = inlineDataRegex.matches(in: textBuffer, range: nsRange)
-            for match in matches {
-                guard match.numberOfRanges > 1,
-                      let dataRange = Range(match.range(at: 1), in: textBuffer) else {
+        private mutating func extractPCM(fromSSELine line: Data) {
+            // SSE lines look like: data: {...json...}
+            guard line.count > 6 else { return }
+            let prefix = line.prefix(5)
+            guard String(decoding: prefix, as: UTF8.self) == "data:" ||
+                    String(decoding: line.prefix(6), as: UTF8.self) == "data: " else {
+                // Also accept raw JSON array elements without the SSE prefix.
+                if line.first == 0x7B { // '{'
+                    extractInlineData(fromJSON: line)
+                }
+                return
+            }
+            var jsonData = line.dropFirst(5)
+            if jsonData.first == 0x20 { jsonData = jsonData.dropFirst() } // skip space
+            if jsonData == Data("[DONE]".utf8) { return }
+            extractInlineData(fromJSON: Data(jsonData))
+        }
+
+        private mutating func extractInlineData(fromJSON jsonData: Data) {
+            guard let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                return
+            }
+            let candidates = json["candidates"] as? [[String: Any]] ?? []
+            for candidate in candidates {
+                guard let content = candidate["content"] as? [String: Any],
+                      let parts = content["parts"] as? [[String: Any]] else {
                     continue
                 }
-                let encoded = String(textBuffer[dataRange])
-                let hash = encoded.hashValue
-                guard !emittedHashes.contains(hash),
-                      let chunk = Data(base64Encoded: encoded) else {
-                    continue
+                for part in parts {
+                    if let inlineData = part["inlineData"] as? [String: Any],
+                       let encoded = inlineData["data"] as? String,
+                       let pcm = Data(base64Encoded: encoded),
+                       !pcm.isEmpty {
+                        pendingPCM.append(pcm)
+                        emittedCount += 1
+                    }
                 }
-                emittedHashes.insert(hash)
-                pendingPCM.append(chunk)
             }
         }
     }
 
     func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(bytes: bytes, inlineDataRegex: inlineDataRegex)
+        AsyncIterator(bytes: bytes)
     }
 }

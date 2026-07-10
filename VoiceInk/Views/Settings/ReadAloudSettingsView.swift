@@ -281,8 +281,8 @@ struct ReadAloudSettingsView: View {
             keyStatusRow(geminiKeyStatus)
 
             Picker("Model", selection: $settings.geminiModel) {
-                Text("2.5 Flash (cheapest)").tag("gemini-2.5-flash-preview-tts")
                 Text("3.1 Flash (fastest — streaming)").tag("gemini-3.1-flash-tts-preview")
+                Text("2.5 Flash (cheapest, waits for full audio)").tag("gemini-2.5-flash-preview-tts")
                 Text("2.5 Pro (highest quality)").tag("gemini-2.5-pro-preview-tts")
             }
             .pickerStyle(.menu)
@@ -304,7 +304,7 @@ struct ReadAloudSettingsView: View {
         } header: {
             Text("Gemini TTS")
         } footer: {
-            Text("Uses the same Gemini API key as AI Models and transcription. Gemini 2.5 Flash is the cheapest cloud option; 3.1 Flash streams audio for faster playback. 70+ languages auto-detected from your text.")
+            Text("Uses the same Gemini API key as AI Models and transcription. Prefer 3.1 Flash — it streams so speech starts sooner. 2.5 Flash is cheaper but waits for the entire clip before playing.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

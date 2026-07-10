@@ -106,8 +106,15 @@ final class ReadAloudSettings: ObservableObject {
         self.openAIVoice = defaults.string(forKey: Keys.openAIVoice) ?? "nova"
         self.openAIModel = defaults.string(forKey: Keys.openAIModel) ?? "tts-1"
         self.geminiVoice = defaults.string(forKey: Keys.geminiVoice) ?? "Kore"
-        // 2.5 Flash is cheapest; 3.1 Flash supports streaming for faster time-to-audio.
-        self.geminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-2.5-flash-preview-tts"
+        // 3.1 Flash streams audio (fast time-to-first-sound). Migrate prior 2.5
+        // defaults once — 2.5 is still available in the picker for cheapest cost.
+        var resolvedGeminiModel = defaults.string(forKey: Keys.geminiModel) ?? "gemini-3.1-flash-tts-preview"
+        if resolvedGeminiModel == "gemini-2.5-flash-preview-tts",
+           !defaults.bool(forKey: "readAloud.migratedGemini31Flash_v1") {
+            resolvedGeminiModel = "gemini-3.1-flash-tts-preview"
+            defaults.set(true, forKey: "readAloud.migratedGemini31Flash_v1")
+        }
+        self.geminiModel = resolvedGeminiModel
         let storedRate = defaults.object(forKey: Keys.rate) as? Float
         self.rate = storedRate ?? 1.0
         let storedPitch = defaults.object(forKey: Keys.pitch) as? Float

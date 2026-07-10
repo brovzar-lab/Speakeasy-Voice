@@ -1,14 +1,16 @@
-import SwiftUI
 import AppKit
+import Combine
 
 /// Tiny floating indicator that shows while a read-aloud session is active.
 ///
-/// Sits above the menu bar as a `nonactivatingPanel` so it never steals focus.
-/// Left-click toggles pause/resume; right-click (or the "×" affordance) stops.
+/// Built with AppKit controls (not SwiftUI `Button`) because SwiftUI button
+/// gestures inside a `nonactivatingPanel` crash on macOS 26 via
+/// `MainActor.assumeIsolated` during click dispatch.
 @MainActor
 final class ReadAloudIndicatorWindow {
     private var panel: IndicatorPanel?
     private weak var manager: ReadAloudManager?
+    private var contentView: ReadAloudIndicatorContentView?
 
     init(manager: ReadAloudManager) {
         self.manager = manager
@@ -16,6 +18,7 @@ final class ReadAloudIndicatorWindow {
 
     func show() {
         if panel == nil { initialize() }
+        contentView?.refresh()
         panel?.show()
     }
 
@@ -27,8 +30,9 @@ final class ReadAloudIndicatorWindow {
         guard let manager else { return }
         let rect = IndicatorPanel.metrics()
         let newPanel = IndicatorPanel(contentRect: rect)
-        let view = ReadAloudIndicatorView(manager: manager)
-        newPanel.contentView = NSHostingView(rootView: view)
+        let content = ReadAloudIndicatorContentView(frame: rect, manager: manager)
+        newPanel.contentView = content
+        contentView = content
         panel = newPanel
     }
 }
@@ -64,7 +68,6 @@ private final class IndicatorPanel: NSPanel {
             return NSRect(x: 40, y: 40, width: width, height: height)
         }
         let visible = screen.visibleFrame
-        // Top-right corner, just under the menu bar.
         let x = visible.maxX - width - 20
         let y = visible.maxY - height - 12
         return NSRect(x: x, y: y, width: width, height: height)
@@ -76,129 +79,192 @@ private final class IndicatorPanel: NSPanel {
     }
 }
 
-// MARK: - SwiftUI content
+// MARK: - AppKit content (crash-safe clicks)
 
-private struct ReadAloudIndicatorView: View {
-    @ObservedObject var manager: ReadAloudManager
-    @ObservedObject private var settings = ReadAloudSettings.shared
+private final class ReadAloudIndicatorContentView: NSView {
+    private weak var manager: ReadAloudManager?
+    private var cancellables = Set<AnyCancellable>()
 
-    var body: some View {
-        HStack(spacing: 8) {
-            statusIcon
-                .frame(width: 18, height: 18)
+    private let effectView = NSVisualEffectView()
+    private let statusImage = NSImageView()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let rateLabel = NSTextField(labelWithString: "1.0×")
+    private let slowerButton = NSButton()
+    private let fasterButton = NSButton()
+    private let playPauseButton = NSButton()
+    private let stopButton = NSButton()
+    private let progressBar = NSView()
+    private var progressWidthConstraint: NSLayoutConstraint?
 
-            Text(statusText)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-
-            Spacer(minLength: 4)
-
-            // Rate controls: slower / current rate / faster
-            HStack(spacing: 2) {
-                Button(action: { manager.slower() }) {
-                    Image(systemName: "tortoise.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .frame(width: 20, height: 22)
-                        .foregroundStyle(canSlowDown ? Color.primary : Color.secondary.opacity(0.4))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSlowDown)
-                .help(Text("Slower"))
-
-                Text(String(format: "%.1f×", settings.rate))
-                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 30)
-                    .contentTransition(.numericText(value: Double(settings.rate)))
-
-                Button(action: { manager.faster() }) {
-                    Image(systemName: "hare.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .frame(width: 20, height: 22)
-                        .foregroundStyle(canSpeedUp ? Color.primary : Color.secondary.opacity(0.4))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSpeedUp)
-                .help(Text("Faster"))
-            }
-            .padding(.horizontal, 2)
-            .background(
-                Capsule().fill(Color.primary.opacity(0.08))
-            )
-
-            Button(action: { manager.togglePlayback() }) {
-                Image(systemName: playPauseIcon)
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 22, height: 22)
-                    .background(Circle().fill(Color.primary.opacity(0.12)))
-                    .foregroundStyle(.primary)
-            }
-            .buttonStyle(.plain)
-            .help(Text(playPauseHelp))
-
-            Button(action: { manager.stop() }) {
-                Image(systemName: "stop.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: 22, height: 22)
-                    .background(Circle().fill(Color.red.opacity(0.75)))
-                    .foregroundStyle(.white)
-            }
-            .buttonStyle(.plain)
-            .help(Text("Stop reading"))
-        }
-        .padding(.horizontal, 9)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
-                )
-        )
-        .overlay(alignment: .bottom) {
-            GeometryReader { geo in
-                Rectangle()
-                    .fill(Color.accentColor)
-                    .frame(width: max(2, geo.size.width * CGFloat(manager.progress)), height: 2)
-                    .animation(.linear(duration: 0.15), value: manager.progress)
-            }
-            .frame(height: 2)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
+    init(frame: NSRect, manager: ReadAloudManager) {
+        self.manager = manager
+        super.init(frame: frame)
+        wantsLayer = true
+        buildUI()
+        bind(manager)
+        refresh()
     }
 
-    private var canSlowDown: Bool {
-        settings.rate > ReadAloudManager.minimumRate + 0.001
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func buildUI() {
+        effectView.material = .hudWindow
+        effectView.blendingMode = .behindWindow
+        effectView.state = .active
+        effectView.wantsLayer = true
+        effectView.layer?.cornerRadius = 12
+        effectView.layer?.masksToBounds = true
+        effectView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(effectView)
+
+        statusImage.imageScaling = .scaleProportionallyDown
+        statusImage.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        statusLabel.textColor = .labelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        configureIconButton(slowerButton, symbol: "tortoise.fill", size: 10, action: #selector(slowerTapped))
+        configureIconButton(fasterButton, symbol: "hare.fill", size: 10, action: #selector(fasterTapped))
+        configureIconButton(playPauseButton, symbol: "pause.fill", size: 11, action: #selector(playPauseTapped))
+        configureIconButton(stopButton, symbol: "stop.fill", size: 10, action: #selector(stopTapped))
+        stopButton.contentTintColor = .white
+        stopButton.wantsLayer = true
+        stopButton.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.75).cgColor
+        stopButton.layer?.cornerRadius = 11
+
+        rateLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        rateLabel.textColor = .secondaryLabelColor
+        rateLabel.alignment = .center
+        rateLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let rateStack = NSStackView(views: [slowerButton, rateLabel, fasterButton])
+        rateStack.orientation = .horizontal
+        rateStack.spacing = 2
+        rateStack.alignment = .centerY
+        rateStack.wantsLayer = true
+        rateStack.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.08).cgColor
+        rateStack.layer?.cornerRadius = 11
+        rateStack.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        rateStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let root = NSStackView(views: [statusImage, statusLabel, spacer, rateStack, playPauseButton, stopButton])
+        root.orientation = .horizontal
+        root.spacing = 8
+        root.alignment = .centerY
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.setHuggingPriority(.defaultLow, for: .horizontal)
+
+        effectView.addSubview(root)
+
+        progressBar.wantsLayer = true
+        progressBar.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        effectView.addSubview(progressBar)
+
+        let progressWidth = progressBar.widthAnchor.constraint(equalToConstant: 2)
+        progressWidthConstraint = progressWidth
+
+        NSLayoutConstraint.activate([
+            effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            effectView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            effectView.topAnchor.constraint(equalTo: topAnchor),
+            effectView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            root.leadingAnchor.constraint(equalTo: effectView.leadingAnchor, constant: 9),
+            root.trailingAnchor.constraint(equalTo: effectView.trailingAnchor, constant: -9),
+            root.topAnchor.constraint(equalTo: effectView.topAnchor),
+            root.bottomAnchor.constraint(equalTo: effectView.bottomAnchor),
+
+            statusImage.widthAnchor.constraint(equalToConstant: 18),
+            statusImage.heightAnchor.constraint(equalToConstant: 18),
+            slowerButton.widthAnchor.constraint(equalToConstant: 20),
+            slowerButton.heightAnchor.constraint(equalToConstant: 22),
+            fasterButton.widthAnchor.constraint(equalToConstant: 20),
+            fasterButton.heightAnchor.constraint(equalToConstant: 22),
+            rateLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            playPauseButton.widthAnchor.constraint(equalToConstant: 22),
+            playPauseButton.heightAnchor.constraint(equalToConstant: 22),
+            stopButton.widthAnchor.constraint(equalToConstant: 22),
+            stopButton.heightAnchor.constraint(equalToConstant: 22),
+
+            progressBar.leadingAnchor.constraint(equalTo: effectView.leadingAnchor),
+            progressBar.bottomAnchor.constraint(equalTo: effectView.bottomAnchor),
+            progressBar.heightAnchor.constraint(equalToConstant: 2),
+            progressWidth
+        ])
+
+        toolTip = nil
+        slowerButton.toolTip = String(localized: "Slower")
+        fasterButton.toolTip = String(localized: "Faster")
+        stopButton.toolTip = String(localized: "Stop reading")
     }
 
-    private var canSpeedUp: Bool {
-        settings.rate < ReadAloudManager.maximumRate - 0.001
+    private func configureIconButton(_ button: NSButton, symbol: String, size: CGFloat, action: Selector) {
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(.init(pointSize: size, weight: .semibold))
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = action
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.focusRingType = .none
     }
 
-    private var statusIcon: some View {
-        Group {
-            switch manager.state {
-            case .idle:
-                Image(systemName: "speaker.slash")
-                    .foregroundStyle(.secondary)
-            case .capturing, .loading:
-                ProgressView()
-                    .controlSize(.small)
-            case .speaking:
-                AnimatedSpeakerIcon()
-            case .paused:
-                Image(systemName: "pause.circle.fill")
-                    .foregroundStyle(.orange)
+    private func bind(_ manager: ReadAloudManager) {
+        manager.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                // Defer one turn so Published values are updated.
+                DispatchQueue.main.async { self?.refresh() }
             }
-        }
-        .font(.system(size: 14, weight: .semibold))
+            .store(in: &cancellables)
+
+        ReadAloudSettings.shared.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.refresh() }
+            }
+            .store(in: &cancellables)
     }
 
-    private var statusText: String {
-        switch manager.state {
+    func refresh() {
+        guard let manager else { return }
+        let settings = ReadAloudSettings.shared
+
+        statusLabel.stringValue = statusText(for: manager.state)
+        statusImage.image = statusImage(for: manager.state)
+        statusImage.contentTintColor = statusTint(for: manager.state)
+
+        rateLabel.stringValue = String(format: "%.1f×", settings.rate)
+        slowerButton.isEnabled = settings.rate > ReadAloudManager.minimumRate + 0.001
+        fasterButton.isEnabled = settings.rate < ReadAloudManager.maximumRate - 0.001
+        slowerButton.alphaValue = slowerButton.isEnabled ? 1.0 : 0.4
+        fasterButton.alphaValue = fasterButton.isEnabled ? 1.0 : 0.4
+
+        let playSymbol = manager.state == .paused ? "play.fill" : "pause.fill"
+        playPauseButton.image = NSImage(
+            systemSymbolName: playSymbol,
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        playPauseButton.toolTip = manager.state == .paused
+            ? String(localized: "Resume")
+            : String(localized: "Pause")
+
+        let width = max(2, bounds.width * CGFloat(manager.progress))
+        progressWidthConstraint?.constant = width
+    }
+
+    private func statusText(for state: ReadAloudState) -> String {
+        switch state {
         case .idle: return String(localized: "Idle")
         case .capturing: return String(localized: "Capturing…")
         case .loading: return String(localized: "Loading…")
@@ -207,32 +273,36 @@ private struct ReadAloudIndicatorView: View {
         }
     }
 
-    private var playPauseIcon: String {
-        switch manager.state {
-        case .paused: return "play.fill"
-        default: return "pause.fill"
+    private func statusImage(for state: ReadAloudState) -> NSImage? {
+        let name: String
+        switch state {
+        case .idle: name = "speaker.slash"
+        case .capturing, .loading: name = "ellipsis.circle"
+        case .speaking: name = "speaker.wave.2.fill"
+        case .paused: name = "pause.circle.fill"
+        }
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        return image?.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+    }
+
+    private func statusTint(for state: ReadAloudState) -> NSColor {
+        switch state {
+        case .speaking: return .controlAccentColor
+        case .paused: return .systemOrange
+        default: return .secondaryLabelColor
         }
     }
 
-    private var playPauseHelp: String {
-        switch manager.state {
-        case .paused: return String(localized: "Resume")
-        default: return String(localized: "Pause")
-        }
-    }
-}
+    @objc private func slowerTapped() { manager?.slower() }
+    @objc private func fasterTapped() { manager?.faster() }
+    @objc private func playPauseTapped() { manager?.togglePlayback() }
+    @objc private func stopTapped() { manager?.stop() }
 
-private struct AnimatedSpeakerIcon: View {
-    @State private var pulse = false
-
-    var body: some View {
-        Image(systemName: "speaker.wave.2.fill")
-            .foregroundStyle(Color.accentColor)
-            .scaleEffect(pulse ? 1.08 : 0.94)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
-                    pulse = true
-                }
-            }
+    override func layout() {
+        super.layout()
+        refresh()
     }
+
+    /// Allow clicks without first activating the panel (nonactivatingPanel).
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
