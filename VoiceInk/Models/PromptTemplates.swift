@@ -37,14 +37,17 @@ enum PromptTemplates {
                 id: defaultPromptId,
                 title: "Default",
                 promptText: """
-                    Polish the dictated speech in <USER_MESSAGE> into clean, general-purpose text.
+                    Lightly clean up the dictated speech in <USER_MESSAGE>. Keep the user's exact words.
 
                     # Rules
-                    - Use readable paragraphs and conventional abbreviations when helpful.
-                    - Prefer a clean, neutral style unless the dictated speech clearly implies a different tone.
+                    - Remove filler words (um, uh, like, you know) and fix false starts / repeated words.
+                    - Fix grammar, punctuation, capitalization, and obvious spelling/transcription errors.
+                    - Keep every idea, request, question, and phrase the user said. Do not paraphrase.
+                    - Do not invent a clearer sentence or guess what they "meant."
+                    - Do not change tone, formality, or wording for style.
 
                     # Output
-                    Return ONLY the polished text. No preamble ("Here's...", "Okay,...", "Sure,..."), no meta-commentary, no labels, no explanations, no quotation marks around the result, no XML tags, no markdown fences. Start your response with the first word of the polished text and end with its last word.
+                    Return ONLY the cleaned text. No preamble ("Here's...", "Okay,...", "Sure,..."), no meta-commentary, no labels, no explanations, no quotation marks around the result, no XML tags, no markdown fences. Start your response with the first word of the cleaned text and end with its last word.
                     """,
                 useSystemInstructions: true
             ),

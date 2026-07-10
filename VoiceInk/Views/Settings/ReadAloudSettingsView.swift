@@ -25,6 +25,16 @@ struct ReadAloudSettingsView: View {
     var body: some View {
         Form {
             Section {
+                ReadAloudUsageWidget(style: .expanded)
+            } header: {
+                Text("Usage & Budget")
+            } footer: {
+                Text(ReadAloudUsageTracker.pricingReference)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Picker("Provider", selection: $settings.provider) {
                     ForEach(ReadAloudProvider.allCases) { provider in
                         Text(provider.displayName).tag(provider)
