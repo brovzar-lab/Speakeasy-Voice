@@ -126,7 +126,7 @@ private struct EnhancementModelSettingsView: View {
             } header: {
                 HStack(spacing: 4) {
                     Text("Request Timeout")
-                    InfoTip("Set how long to wait for the AI provider to respond. If no response is received within this duration, you can either fail immediately and paste the original transcription, or retry the request up to 3 attempts.")
+                    InfoTip("Set how long to wait for the AI provider to respond. If no response is received, ordinary dictation quietly pastes the original transcript. Response mode can fail immediately or retry once.")
                 }
             }
         }

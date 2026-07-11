@@ -41,6 +41,18 @@ enum GeminiSSEDecodingError: Error {
     case malformedEvent
 }
 
+enum GeminiStreamFailurePolicy {
+    static func resolve(bytesPlayed: Int, underlying: CloudTTSError) -> CloudTTSError {
+        if bytesPlayed > 0 {
+            return .streamEndedEarly
+        }
+        if case .streamEndedEarly = underlying {
+            return .emptyAudioStream
+        }
+        return underlying
+    }
+}
+
 /// Pure SSE event decoder kept outside the MainActor provider so JSON/base64
 /// work can be tested and performed on a background executor.
 enum GeminiSSEEventDecoder {
@@ -127,6 +139,207 @@ private final class GeminiStreamMonitor: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return (byteCount, storedError, firstPCMSeconds)
+    }
+}
+
+struct PCMStreamSegment: @unchecked Sendable {
+    let stream: AsyncStream<Data>
+    let cancel: @Sendable () -> Void
+    let validate: @Sendable () throws -> Void
+
+    static func wrapping(_ stream: AsyncStream<Data>) -> PCMStreamSegment {
+        PCMStreamSegment(stream: stream, cancel: {}, validate: {})
+    }
+}
+
+private final class PCMStreamTaskHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelAction: (@Sendable () -> Void)?
+    private var isCancelled = false
+
+    func install(_ cancelAction: @escaping @Sendable () -> Void) {
+        lock.lock()
+        self.cancelAction = cancelAction
+        let shouldCancel = isCancelled
+        lock.unlock()
+        if shouldCancel { cancelAction() }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let action = cancelAction
+        lock.unlock()
+        action?()
+    }
+}
+
+private final class PCMStreamPrefetchSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var taskCancel: (@Sendable () -> Void)?
+    private var segment: PCMStreamSegment?
+    private var isCancelled = false
+
+    func installTask(_ cancel: @escaping @Sendable () -> Void) {
+        lock.lock()
+        taskCancel = cancel
+        let shouldCancel = isCancelled
+        lock.unlock()
+        if shouldCancel { cancel() }
+    }
+
+    func installSegment(_ segment: PCMStreamSegment) {
+        lock.lock()
+        self.segment = segment
+        let shouldCancel = isCancelled
+        lock.unlock()
+        if shouldCancel { segment.cancel() }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let cancelTask = taskCancel
+        let cancelSegment = segment?.cancel
+        lock.unlock()
+        cancelTask?()
+        cancelSegment?()
+    }
+}
+
+private final class PCMStreamLifecycle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: PCMStreamSegment?
+    private var prefetched: PCMStreamPrefetchSlot?
+
+    func setCurrent(_ segment: PCMStreamSegment?) {
+        lock.lock()
+        current = segment
+        lock.unlock()
+    }
+
+    func setPrefetched(_ slot: PCMStreamPrefetchSlot?) {
+        lock.lock()
+        prefetched = slot
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let current = current
+        let prefetched = prefetched
+        lock.unlock()
+        current?.cancel()
+        prefetched?.cancel()
+    }
+}
+
+/// Joins multiple PCM-producing requests into one ordered stream. It keeps one
+/// bounded text segment ahead so provider setup cannot create an audible gap,
+/// while explicit cancellation handles stop both current and prefetched work.
+enum PCMStreamConcatenator {
+    @MainActor
+    static func concatenate(_ streams: [AsyncStream<Data>]) -> AsyncStream<Data> {
+        concatenate(count: streams.count) { index in
+            PCMStreamSegment.wrapping(streams[index])
+        }
+    }
+
+    @MainActor
+    static func concatenate(
+        count: Int,
+        segmentAt: @escaping @MainActor (Int) async throws -> PCMStreamSegment,
+        onChunk: @escaping @MainActor (Data) -> Void = { _ in },
+        onError: @escaping @MainActor (Error) -> Void = { _ in }
+    ) -> AsyncStream<Data> {
+        let lifecycle = PCMStreamLifecycle()
+        return AsyncStream { continuation in
+            let task = Task { @MainActor in
+                func prefetch(_ index: Int) -> (
+                    slot: PCMStreamPrefetchSlot,
+                    task: Task<PCMStreamSegment, Error>
+                ) {
+                    let slot = PCMStreamPrefetchSlot()
+                    let task = Task { @MainActor in
+                        let segment = try await segmentAt(index)
+                        slot.installSegment(segment)
+                        return segment
+                    }
+                    slot.installTask { task.cancel() }
+                    lifecycle.setPrefetched(slot)
+                    return (slot, task)
+                }
+
+                var pending = count > 0 ? prefetch(0) : nil
+                do {
+                    for index in 0..<count {
+                        try Task.checkCancellation()
+                        guard let currentPending = pending else { break }
+                        let segment = try await withTaskCancellationHandler {
+                            try await currentPending.task.value
+                        } onCancel: {
+                            currentPending.slot.cancel()
+                        }
+
+                        lifecycle.setCurrent(segment)
+                        if index + 1 < count {
+                            pending = prefetch(index + 1)
+                        } else {
+                            pending = nil
+                            lifecycle.setPrefetched(nil)
+                        }
+
+                        for await chunk in segment.stream {
+                            try Task.checkCancellation()
+                            if !chunk.isEmpty {
+                                onChunk(chunk)
+                                continuation.yield(chunk)
+                            }
+                        }
+                        try segment.validate()
+                        segment.cancel()
+                        lifecycle.setCurrent(nil)
+                    }
+                } catch {
+                    onError(error)
+                }
+                lifecycle.cancelAll()
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                lifecycle.cancelAll()
+                task.cancel()
+            }
+        }
+    }
+}
+
+/// Owns the user-visible invariant that any number of cloud PCM segments are
+/// consumed by exactly one playback session.
+enum PCMContinuousPlaybackCoordinator {
+    @MainActor
+    static func play(
+        streams: [AsyncStream<Data>],
+        playback: @escaping @MainActor (AsyncStream<Data>) async -> Void
+    ) async {
+        await playback(PCMStreamConcatenator.concatenate(streams))
+    }
+
+    @MainActor
+    static func play(
+        count: Int,
+        segmentAt: @escaping @MainActor (Int) async throws -> PCMStreamSegment,
+        onChunk: @escaping @MainActor (Data) -> Void,
+        onError: @escaping @MainActor (Error) -> Void,
+        playback: @escaping @MainActor (AsyncStream<Data>) async -> Void
+    ) async {
+        let stream = PCMStreamConcatenator.concatenate(
+            count: count,
+            segmentAt: segmentAt,
+            onChunk: onChunk,
+            onError: onError
+        )
+        await playback(stream)
     }
 }
 
@@ -792,43 +1005,47 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         let voiceName = voice.voiceIdentifier ?? "Kore"
         let settings = ReadAloudSettings.shared
         let chunks: [String]
-        if trimmed.count > 1_000, let split = SentenceChunker.chunkIfNeeded(trimmed) {
+        if trimmed.count > SentenceChunker.maxChunkChars,
+           let split = SentenceChunker.chunkIfNeeded(trimmed) {
             chunks = split
         } else {
             chunks = [trimmed]
         }
 
-        for chunk in chunks {
-            try Task.checkCancellation()
-            let bodyData = try Self.makeRequestBody(text: chunk, voiceName: voiceName)
-
-            if settings.geminiSupportsStreaming {
-                do {
-                    try await speakWithStreaming(
-                        model: model,
-                        bodyData: bodyData,
-                        apiKey: apiKey,
-                        voice: voice
-                    )
-                    continue
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch CloudTTSError.streamEndedEarly {
-                    // Audio may already have played. Replaying the same chunk via
-                    // batch would duplicate speech, so surface a clear error.
-                    throw CloudTTSError.streamEndedEarly
-                } catch {
-                    logger.warning("Gemini streaming failed, falling back to batch: \(error.localizedDescription, privacy: .public)")
-                }
+        if settings.geminiSupportsStreaming {
+            do {
+                let bodies = try chunks.map { try Self.makeRequestBody(text: $0, voiceName: voiceName) }
+                try await speakWithStreaming(
+                    model: model,
+                    bodyDatas: bodies,
+                    apiKey: apiKey,
+                    voice: voice
+                )
+                ReadAloudUsageTracker.shared.record(
+                    provider: "gemini",
+                    model: model,
+                    voiceId: voiceName,
+                    characterCount: trimmed.count
+                )
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch CloudTTSError.streamEndedEarly {
+                // Audio may already have played. Replaying the selection via
+                // batch would duplicate speech, so surface a clear error.
+                throw CloudTTSError.streamEndedEarly
+            } catch {
+                logger.warning("Gemini streaming failed before playback, falling back to continuous batch playback: \(error.localizedDescription, privacy: .public)")
             }
-
-            try await speakWithBatch(
-                model: model,
-                bodyData: bodyData,
-                apiKey: apiKey,
-                voice: voice
-            )
         }
+
+        let bodies = try chunks.map { try Self.makeRequestBody(text: $0, voiceName: voiceName) }
+        try await speakWithBatch(
+            model: model,
+            bodyDatas: bodies,
+            apiKey: apiKey,
+            voice: voice
+        )
 
         ReadAloudUsageTracker.shared.record(
             provider: "gemini",
@@ -864,10 +1081,36 @@ final class GeminiTTSProvider: TextToSpeechProvider {
 
     private func speakWithBatch(
         model: String,
-        bodyData: Data,
+        bodyDatas: [Data],
         apiKey: String,
         voice: VoiceConfiguration
     ) async throws {
+        var combinedPCM = Data()
+
+        for bodyData in bodyDatas {
+            try Task.checkCancellation()
+            combinedPCM.append(try await batchPCM(
+                model: model,
+                bodyData: bodyData,
+                apiKey: apiKey
+            ))
+        }
+
+        guard !combinedPCM.isEmpty else { throw CloudTTSError.emptyAudioStream }
+        await audioPlayer.play(
+            pcmData: combinedPCM,
+            sampleRate: Self.pcmSampleRate,
+            volume: voice.volume,
+            initialRate: voice.rate
+        )
+        try Task.checkCancellation()
+    }
+
+    private func batchPCM(
+        model: String,
+        bodyData: Data,
+        apiKey: String
+    ) async throws -> Data {
         var request = URLRequest(
             url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
         )
@@ -891,21 +1134,87 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             throw CloudTTSError.decodingFailed
         }
 
-        await audioPlayer.play(
-            pcmData: pcm,
-            sampleRate: Self.pcmSampleRate,
-            volume: voice.volume,
-            initialRate: voice.rate
-        )
-        try Task.checkCancellation()
+        return pcm
     }
 
     private func speakWithStreaming(
         model: String,
-        bodyData: Data,
+        bodyDatas: [Data],
         apiKey: String,
         voice: VoiceConfiguration
     ) async throws {
+        let playbackStart = Date()
+        let aggregateMonitor = GeminiStreamMonitor(startedAt: playbackStart)
+
+        await PCMContinuousPlaybackCoordinator.play(
+            count: bodyDatas.count,
+            segmentAt: { [weak self] index in
+                guard let self else { throw CancellationError() }
+                try Task.checkCancellation()
+
+                if aggregateMonitor.result.error != nil {
+                    return PCMStreamSegment.wrapping(AsyncStream { $0.finish() })
+                }
+
+                let (chunkSegment, chunkMonitor) = try await self.streamingPCMStream(
+                    model: model,
+                    bodyData: bodyDatas[index],
+                    apiKey: apiKey
+                )
+
+                return PCMStreamSegment(
+                    stream: chunkSegment.stream,
+                    cancel: chunkSegment.cancel,
+                    validate: {
+                        let result = chunkMonitor.result
+                        if let error = result.error {
+                            throw GeminiStreamFailurePolicy.resolve(
+                                bytesPlayed: aggregateMonitor.result.bytes,
+                                underlying: error
+                            )
+                        } else if result.bytes == 0 {
+                            throw GeminiStreamFailurePolicy.resolve(
+                                bytesPlayed: aggregateMonitor.result.bytes,
+                                underlying: .emptyAudioStream
+                            )
+                        }
+                    }
+                )
+            },
+            onChunk: { pcm in
+                aggregateMonitor.record(bytes: pcm.count)
+            },
+            onError: { error in
+                aggregateMonitor.fail(GeminiStreamFailurePolicy.resolve(
+                    bytesPlayed: aggregateMonitor.result.bytes,
+                    underlying: (error as? CloudTTSError) ?? .decodingFailed
+                ))
+            },
+            playback: { [weak self] combinedStream in
+                guard let self else { return }
+                await self.audioPlayer.playStreamingPCM(
+                    from: combinedStream,
+                    sampleRate: Self.pcmSampleRate,
+                    volume: voice.volume,
+                    initialRate: voice.rate
+                )
+            }
+        )
+        try Task.checkCancellation()
+
+        let result = aggregateMonitor.result
+        if let firstPCMSeconds = result.firstPCMSeconds {
+            logger.notice("[LATENCY] Gemini first-pcm duration=\(firstPCMSeconds, format: .fixed(precision: 3), privacy: .public)s bytes=\(result.bytes, privacy: .public)")
+        }
+        if let error = result.error { throw error }
+        guard result.bytes > 0 else { throw CloudTTSError.emptyAudioStream }
+    }
+
+    private func streamingPCMStream(
+        model: String,
+        bodyData: Data,
+        apiKey: String
+    ) async throws -> (PCMStreamSegment, GeminiStreamMonitor) {
         let requestStart = Date()
         var request = URLRequest(
             url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse")!
@@ -931,36 +1240,16 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         logger.notice("[LATENCY] Gemini response-headers duration=\(Date().timeIntervalSince(requestStart), format: .fixed(precision: 3), privacy: .public)s")
 
         try Task.checkCancellation()
-        let (pcmStream, monitor) = Self.decodeGeminiSSEToPCMChunks(bytes, startedAt: requestStart)
-        await audioPlayer.playStreamingPCM(
-            from: pcmStream,
-            sampleRate: Self.pcmSampleRate,
-            volume: voice.volume,
-            initialRate: voice.rate
-        )
-        try Task.checkCancellation()
-
-        let result = monitor.result
-        if let firstPCMSeconds = result.firstPCMSeconds {
-            logger.notice("[LATENCY] Gemini first-pcm duration=\(firstPCMSeconds, format: .fixed(precision: 3), privacy: .public)s bytes=\(result.bytes, privacy: .public)")
-        }
-        if let error = result.error {
-            // Once any PCM has been handed to the player, a batch fallback would
-            // repeat words the user already heard. Treat every later decode or
-            // provider failure as an interrupted stream instead.
-            if result.bytes > 0 { throw CloudTTSError.streamEndedEarly }
-            if case .streamEndedEarly = error { throw CloudTTSError.emptyAudioStream }
-            throw error
-        }
-        guard result.bytes > 0 else { throw CloudTTSError.emptyAudioStream }
+        return Self.decodeGeminiSSEToPCMChunks(bytes, startedAt: requestStart)
     }
 
     /// Decode Gemini SSE into PCM `Data` chunks on a background task.
     private static func decodeGeminiSSEToPCMChunks(
         _ bytes: URLSession.AsyncBytes,
         startedAt: Date
-    ) -> (AsyncStream<Data>, GeminiStreamMonitor) {
+    ) -> (PCMStreamSegment, GeminiStreamMonitor) {
         let monitor = GeminiStreamMonitor(startedAt: startedAt)
+        let taskHandle = PCMStreamTaskHandle()
         let stream = AsyncStream<Data> { continuation in
             let task = Task.detached {
                 var lineBuffer = Data()
@@ -998,9 +1287,17 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                     continuation.finish()
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            taskHandle.install { task.cancel() }
+            continuation.onTermination = { _ in taskHandle.cancel() }
         }
-        return (stream, monitor)
+        return (
+            PCMStreamSegment(
+                stream: stream,
+                cancel: { taskHandle.cancel() },
+                validate: {}
+            ),
+            monitor
+        )
     }
 
     nonisolated private static func processGeminiSSELine(

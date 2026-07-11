@@ -2,6 +2,30 @@ import Foundation
 import SwiftData
 import os
 
+struct EnhancementExecutionPolicy: Equatable {
+    let timeoutOverride: TimeInterval?
+    let retryOnTimeoutOverride: Bool?
+    let maxAttemptsOverride: Int?
+    let showUserWarning: Bool
+
+    static func forDictation(isResponseMode: Bool) -> EnhancementExecutionPolicy {
+        if isResponseMode {
+            return EnhancementExecutionPolicy(
+                timeoutOverride: nil,
+                retryOnTimeoutOverride: nil,
+                maxAttemptsOverride: nil,
+                showUserWarning: true
+            )
+        }
+        return EnhancementExecutionPolicy(
+            timeoutOverride: 4,
+            retryOnTimeoutOverride: false,
+            maxAttemptsOverride: 1,
+            showUserWarning: false
+        )
+    }
+}
+
 /// Handles the full post-recording pipeline:
 /// transcribe → filter → format → word-replace → AI enhance → deliver → save
 @MainActor
@@ -160,6 +184,9 @@ class TranscriptionPipeline {
                     } == true
                 outputForDelivery = resolvedOutputConfiguration
                 responseConfig = shouldRespondInRecorder ? resolvedEnhancementConfiguration : nil
+                let enhancementPolicy = EnhancementExecutionPolicy.forDictation(
+                    isResponseMode: shouldRespondInRecorder
+                )
 
                 let isSkipShortEnhancementEnabled = UserDefaults.standard.bool(forKey: "SkipShortEnhancement")
                 let savedThreshold = UserDefaults.standard.integer(forKey: "ShortEnhancementWordThreshold")
@@ -186,7 +213,10 @@ class TranscriptionPipeline {
                         let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(
                             textForAI,
                             configuration: resolvedEnhancementConfiguration,
-                            contextSnapshot: contextSnapshot
+                            contextSnapshot: contextSnapshot,
+                            timeoutOverride: enhancementPolicy.timeoutOverride,
+                            retryOnTimeoutOverride: enhancementPolicy.retryOnTimeoutOverride,
+                            maxAttemptsOverride: enhancementPolicy.maxAttemptsOverride
                         )
                         transcription.enhancedText = enhancedText
                         transcription.aiEnhancementModelName = resolvedEnhancementConfiguration.modelName ?? resolvedEnhancementConfiguration.provider?.defaultModel
@@ -199,13 +229,16 @@ class TranscriptionPipeline {
                     } catch {
                         let errorDescription = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                         transcription.enhancedText = String(format: String(localized: "Enhancement failed: %@"), errorDescription)
-                        responseError = errorDescription
-                        let shortReason = String(errorDescription.prefix(80))
-                        await MainActor.run {
-                            NotificationManager.shared.showNotification(
-                                title: String(format: String(localized: "Enhancement failed: %@"), shortReason),
-                                type: .warning
-                            )
+                        responseError = shouldRespondInRecorder ? errorDescription : nil
+                        logger.warning("Enhancement failed; delivering original transcript: \(errorDescription, privacy: .public)")
+                        if enhancementPolicy.showUserWarning {
+                            let shortReason = String(errorDescription.prefix(80))
+                            await MainActor.run {
+                                NotificationManager.shared.showNotification(
+                                    title: String(format: String(localized: "Enhancement failed: %@"), shortReason),
+                                    type: .warning
+                                )
+                            }
                         }
                         if shouldCancel() { await finishCanceledTranscription(); return }
                     }

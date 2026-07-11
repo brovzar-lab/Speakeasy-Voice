@@ -36,16 +36,17 @@ final class LocalCLIService {
     static let selectedTemplateKey = "localCLISelectedTemplate"
     static let timeoutSecondsKey = "localCLITimeoutSeconds"
     static let defaultTimeoutSeconds: Double = 45
+    private let defaults: UserDefaults
 
     var commandTemplate: String {
         didSet {
-            UserDefaults.standard.set(commandTemplate, forKey: Self.commandTemplateKey)
+            defaults.set(commandTemplate, forKey: Self.commandTemplateKey)
         }
     }
 
     var selectedTemplate: LocalCLITemplate {
         didSet {
-            UserDefaults.standard.set(selectedTemplate.rawValue, forKey: Self.selectedTemplateKey)
+            defaults.set(selectedTemplate.rawValue, forKey: Self.selectedTemplateKey)
         }
     }
 
@@ -56,7 +57,7 @@ final class LocalCLIService {
                 timeoutSeconds = clamped
                 return
             }
-            UserDefaults.standard.set(timeoutSeconds, forKey: Self.timeoutSecondsKey)
+            defaults.set(timeoutSeconds, forKey: Self.timeoutSecondsKey)
         }
     }
 
@@ -64,13 +65,14 @@ final class LocalCLIService {
         !commandTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    init() {
-        let savedTemplateRaw = UserDefaults.standard.string(forKey: Self.selectedTemplateKey) ?? ""
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let savedTemplateRaw = defaults.string(forKey: Self.selectedTemplateKey) ?? ""
         selectedTemplate = LocalCLITemplate(rawValue: savedTemplateRaw) ?? .pi
 
-        commandTemplate = UserDefaults.standard.string(forKey: Self.commandTemplateKey) ?? ""
+        commandTemplate = defaults.string(forKey: Self.commandTemplateKey) ?? ""
 
-        let savedTimeout = UserDefaults.standard.double(forKey: Self.timeoutSecondsKey)
+        let savedTimeout = defaults.double(forKey: Self.timeoutSecondsKey)
         timeoutSeconds = savedTimeout > 0 ? savedTimeout : Self.defaultTimeoutSeconds
     }
 
@@ -79,7 +81,11 @@ final class LocalCLIService {
         commandTemplate = template.commandTemplate
     }
 
-    func enhance(systemPrompt: String, userPrompt: String) async throws -> String {
+    func enhance(
+        systemPrompt: String,
+        userPrompt: String,
+        timeoutOverride: TimeInterval? = nil
+    ) async throws -> String {
         guard isConfigured else {
             throw LocalCLIError.commandNotConfigured
         }
@@ -90,7 +96,7 @@ final class LocalCLIService {
             systemPrompt: systemPrompt,
             userPrompt: userPrompt,
             fullPrompt: fullPrompt,
-            timeout: timeoutSeconds
+            timeout: timeoutOverride ?? timeoutSeconds
         )
     }
 
@@ -156,7 +162,6 @@ final class LocalCLIService {
                 if waitResult == .timedOut {
                     if process.isRunning {
                         process.terminate()
-                        _ = semaphore.wait(timeout: .now() + 2)
                     }
                     continuation.resume(throwing: LocalCLIError.timeout(seconds: timeout))
                     return

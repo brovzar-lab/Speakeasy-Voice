@@ -195,8 +195,8 @@ struct ReadAloudSettingsView: View {
 
             Picker("Model", selection: $settings.elevenLabsModelId) {
                 Text("Flash v2.5 (fastest — recommended)").tag("eleven_flash_v2_5")
-                Text("Turbo v2.5 (balanced)").tag("eleven_turbo_v2_5")
-                Text("Multilingual v2 (highest quality)").tag("eleven_multilingual_v2")
+                Text("Multilingual v2 (most stable for long reads)").tag("eleven_multilingual_v2")
+                Text("Turbo v2.5 (deprecated — use Flash)").tag("eleven_turbo_v2_5")
             }
             .pickerStyle(.menu)
 
@@ -239,9 +239,9 @@ struct ReadAloudSettingsView: View {
             keyStatusRow(openAIKeyStatus)
 
             Picker("Model", selection: $settings.openAIModel) {
-                Text("tts-1 (fast)").tag("tts-1")
+                Text("tts-1 (fast, stable)").tag("tts-1")
                 Text("tts-1-hd (higher fidelity)").tag("tts-1-hd")
-                Text("gpt-4o-mini-tts (steerable, all voices)").tag("gpt-4o-mini-tts")
+                Text("gpt-4o-mini-tts (deprecated)").tag("gpt-4o-mini-tts")
             }
             .pickerStyle(.menu)
 
@@ -281,9 +281,9 @@ struct ReadAloudSettingsView: View {
             keyStatusRow(geminiKeyStatus)
 
             Picker("Model", selection: $settings.geminiModel) {
-                Text("3.1 Flash (fastest — streaming)").tag("gemini-3.1-flash-tts-preview")
-                Text("2.5 Flash (cheapest)").tag("gemini-2.5-flash-preview-tts")
-                Text("2.5 Pro (highest quality)").tag("gemini-2.5-pro-preview-tts")
+                Text("3.1 Flash Preview (fastest — streaming)").tag("gemini-3.1-flash-tts-preview")
+                Text("2.5 Flash Preview (cheapest)").tag("gemini-2.5-flash-preview-tts")
+                Text("2.5 Pro Preview (highest quality)").tag("gemini-2.5-pro-preview-tts")
             }
             .pickerStyle(.menu)
 
@@ -304,7 +304,7 @@ struct ReadAloudSettingsView: View {
         } header: {
             Text("Gemini TTS")
         } footer: {
-            Text("Uses the same Gemini API key as AI Models and transcription. Prefer 3.1 Flash — it streams so speech starts sooner. 2.5 models wait for the full clip.")
+            Text("All Gemini TTS models are Preview releases. Prefer 3.1 Flash for speed; choose ElevenLabs or OpenAI when reliability matters more.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
