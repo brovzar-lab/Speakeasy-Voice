@@ -100,12 +100,16 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     /// Stream 16-bit mono PCM and begin playback as soon as the first chunk arrives.
-    func playStreamingPCM<S: AsyncSequence>(
-        from stream: S,
+    ///
+    /// Expects **Data chunks** (not individual bytes). Network/decode work runs off
+    /// the main actor; only buffer scheduling hops to MainActor. Byte-at-a-time
+    /// MainActor streaming previously crashed SwiftUI on macOS 26.
+    func playStreamingPCM(
+        from stream: AsyncStream<Data>,
         sampleRate: Double,
         volume: Float,
         initialRate: Float = 1.0
-    ) async where S.Element == UInt8 {
+    ) async {
         stop()
         didResolveContinuation = false
 
@@ -116,20 +120,22 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
 
         streamingNode?.play()
 
+        let bytesPerFrame = 2
+        // ~250ms of audio before we kick off playback.
+        let startupThreshold = Int(sampleRate) * bytesPerFrame / 4
+
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             self.continuation = cont
 
-            self.streamingTask = Task { @MainActor in
+            self.streamingTask = Task.detached { [weak self] in
                 var pending = Data()
-                let bytesPerFrame = 2
-                // ~250ms of audio before we kick off playback.
-                let startupThreshold = Int(sampleRate) * bytesPerFrame / 4
                 var didStartPlayback = false
 
                 do {
-                    for try await byte in stream {
+                    for await chunk in stream {
                         try Task.checkCancellation()
-                        pending.append(byte)
+                        guard !chunk.isEmpty else { continue }
+                        pending.append(chunk)
 
                         let alignedCount = pending.count - (pending.count % bytesPerFrame)
                         guard alignedCount > 0 else { continue }
@@ -139,26 +145,36 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                             : alignedCount >= startupThreshold / 2
 
                         if shouldFlush {
-                            let chunk = pending.prefix(alignedCount)
+                            let toPlay = Data(pending.prefix(alignedCount))
                             pending.removeFirst(alignedCount)
-                            self.scheduleStreamingPCMBuffer(Data(chunk))
                             didStartPlayback = true
+                            await MainActor.run {
+                                self?.scheduleStreamingPCMBuffer(toPlay)
+                            }
                         }
                     }
 
                     if !pending.isEmpty {
                         let alignedCount = pending.count - (pending.count % bytesPerFrame)
                         if alignedCount > 0 {
-                            self.scheduleStreamingPCMBuffer(Data(pending.prefix(alignedCount)))
+                            let toPlay = Data(pending.prefix(alignedCount))
+                            await MainActor.run {
+                                self?.scheduleStreamingPCMBuffer(toPlay)
+                            }
                         }
                     }
 
-                    self.streamEnded = true
-                    if self.pendingStreamingBuffers == 0 {
-                        self.finishStreamingPlayback()
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.streamEnded = true
+                        if self.pendingStreamingBuffers == 0 {
+                            self.finishStreamingPlayback()
+                        }
                     }
                 } catch {
-                    self.finishStreamingPlayback()
+                    await MainActor.run {
+                        self?.finishStreamingPlayback()
+                    }
                 }
             }
         }
@@ -479,12 +495,42 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
             characterCount: trimmed.count
         )
 
+        let pcmStream = Self.chunkAsyncBytes(bytes, chunkSize: 8_192)
         await audioPlayer.playStreamingPCM(
-            from: bytes,
+            from: pcmStream,
             sampleRate: 16_000,
             volume: voice.volume,
             initialRate: voice.rate
         )
+    }
+
+    /// Fold `URLSession.AsyncBytes` into ~8KB `Data` chunks so playback never
+    /// hops to MainActor once per byte.
+    private static func chunkAsyncBytes(_ bytes: URLSession.AsyncBytes, chunkSize: Int) -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            let task = Task {
+                var buffer = Data()
+                buffer.reserveCapacity(chunkSize)
+                do {
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        buffer.append(byte)
+                        if buffer.count >= chunkSize {
+                            continuation.yield(buffer)
+                            buffer = Data()
+                            buffer.reserveCapacity(chunkSize)
+                        }
+                    }
+                    if !buffer.isEmpty {
+                        continuation.yield(buffer)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish()
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     private func speakWithBatchMP3(
@@ -615,8 +661,8 @@ final class OpenAITTSProvider: TextToSpeechProvider {
 
 /// Text-to-speech via the Gemini `generateContent` / `streamGenerateContent` APIs.
 ///
-/// Returns 24 kHz 16-bit mono PCM. Gemini 3.1 Flash supports streaming so playback
-/// can start before the full response arrives; 2.5 Flash uses batch generateContent.
+/// Returns 24 kHz 16-bit mono PCM. Gemini 3.1 Flash streams via SSE (PCM chunks
+/// decoded off the main actor). Older 2.5 models use batch `generateContent`.
 @MainActor
 final class GeminiTTSProvider: TextToSpeechProvider {
     static let pcmSampleRate: Double = 24_000
@@ -778,13 +824,76 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             characterCount: trimmed.count
         )
 
-        let pcmStream = GeminiPCMStreamDecoder(bytes: bytes)
+        let pcmStream = Self.decodeGeminiSSEToPCMChunks(bytes)
         await audioPlayer.playStreamingPCM(
             from: pcmStream,
             sampleRate: Self.pcmSampleRate,
             volume: voice.volume,
             initialRate: voice.rate
         )
+    }
+
+    /// Decode Gemini SSE into PCM `Data` chunks on a background task.
+    private static func decodeGeminiSSEToPCMChunks(_ bytes: URLSession.AsyncBytes) -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            let task = Task {
+                var lineBuffer = Data()
+                var networkChunk = Data()
+                networkChunk.reserveCapacity(8_192)
+
+                do {
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        networkChunk.append(byte)
+                        guard networkChunk.count >= 8_192 || byte == 0x0A else { continue }
+
+                        lineBuffer.append(networkChunk)
+                        networkChunk.removeAll(keepingCapacity: true)
+
+                        while let newline = lineBuffer.firstIndex(of: 0x0A) {
+                            let line = lineBuffer.subdata(in: lineBuffer.startIndex..<newline)
+                            let nextStart = lineBuffer.index(after: newline)
+                            lineBuffer.removeSubrange(lineBuffer.startIndex..<nextStart)
+                            if let pcm = extractPCMFromSSELine(line), !pcm.isEmpty {
+                                continuation.yield(pcm)
+                            }
+                        }
+                    }
+
+                    if !networkChunk.isEmpty {
+                        lineBuffer.append(networkChunk)
+                    }
+                    if !lineBuffer.isEmpty, let pcm = extractPCMFromSSELine(lineBuffer), !pcm.isEmpty {
+                        continuation.yield(pcm)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish()
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private static func extractPCMFromSSELine(_ line: Data) -> Data? {
+        guard line.count > 6 else {
+            if line.first == 0x7B { // '{'
+                return extractPCM(from: line)
+            }
+            return nil
+        }
+        let prefix5 = String(decoding: line.prefix(5), as: UTF8.self)
+        let prefix6 = String(decoding: line.prefix(6), as: UTF8.self)
+        if prefix5 == "data:" || prefix6 == "data: " {
+            var jsonData = line.dropFirst(5)
+            if jsonData.first == 0x20 { jsonData = jsonData.dropFirst() }
+            if jsonData == Data("[DONE]".utf8) { return nil }
+            return extractPCM(from: Data(jsonData))
+        }
+        if line.first == 0x7B {
+            return extractPCM(from: line)
+        }
+        return nil
     }
 
     private static func extractPCM(from data: Data) -> Data? {
@@ -796,13 +905,23 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             return nil
         }
 
+        var combined = Data()
         for part in parts {
-            if let inlineData = part["inlineData"] as? [String: Any],
-               let encoded = inlineData["data"] as? String,
-               let pcm = Data(base64Encoded: encoded) {
-                return pcm
+            guard let inlineData = inlineDataDict(from: part),
+                  let encoded = inlineData["data"] as? String,
+                  let pcm = Data(base64Encoded: encoded),
+                  !pcm.isEmpty else {
+                continue
             }
+            combined.append(pcm)
         }
+        return combined.isEmpty ? nil : combined
+    }
+
+    /// Gemini may return camelCase (`inlineData`) or snake_case (`inline_data`).
+    private static func inlineDataDict(from part: [String: Any]) -> [String: Any]? {
+        if let dict = part["inlineData"] as? [String: Any] { return dict }
+        if let dict = part["inline_data"] as? [String: Any] { return dict }
         return nil
     }
 
@@ -814,126 +933,5 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             let body = String(data: data, encoding: .utf8)
             throw CloudTTSError.httpError(http.statusCode, body)
         }
-    }
-}
-
-/// Decodes Gemini `streamGenerateContent?alt=sse` into a raw PCM byte stream.
-///
-/// Reads network bytes in bulk (not one-by-one into a String) and extracts
-/// base64 `inlineData.data` fields as soon as each SSE event arrives.
-private struct GeminiPCMStreamDecoder: AsyncSequence {
-    typealias Element = UInt8
-
-    private let bytes: URLSession.AsyncBytes
-
-    init(bytes: URLSession.AsyncBytes) {
-        self.bytes = bytes
-    }
-
-    struct AsyncIterator: AsyncIteratorProtocol {
-        private var byteIterator: URLSession.AsyncBytes.AsyncIterator
-        private var lineBuffer = Data()
-        private var pendingPCM = Data()
-        private var pendingIndex = 0
-        private var finished = false
-        private var emittedCount = 0
-
-        init(bytes: URLSession.AsyncBytes) {
-            self.byteIterator = bytes.makeAsyncIterator()
-        }
-
-        mutating func next() async throws -> UInt8? {
-            while true {
-                if pendingIndex < pendingPCM.count {
-                    let byte = pendingPCM[pendingIndex]
-                    pendingIndex += 1
-                    return byte
-                }
-
-                pendingPCM.removeAll(keepingCapacity: true)
-                pendingIndex = 0
-
-                if finished {
-                    return nil
-                }
-
-                // Pull a chunk of network bytes, then split on newlines for SSE.
-                var chunk = Data()
-                chunk.reserveCapacity(8_192)
-                while chunk.count < 8_192, let byte = try await byteIterator.next() {
-                    chunk.append(byte)
-                }
-
-                if chunk.isEmpty {
-                    // Flush any trailing line.
-                    if !lineBuffer.isEmpty {
-                        extractPCM(fromSSELine: lineBuffer)
-                        lineBuffer.removeAll(keepingCapacity: true)
-                        if !pendingPCM.isEmpty {
-                            finished = true
-                            continue
-                        }
-                    }
-                    finished = true
-                    return nil
-                }
-
-                lineBuffer.append(chunk)
-                while let newline = lineBuffer.firstIndex(of: 0x0A) {
-                    let line = lineBuffer.subdata(in: lineBuffer.startIndex..<newline)
-                    let nextStart = lineBuffer.index(after: newline)
-                    lineBuffer.removeSubrange(lineBuffer.startIndex..<nextStart)
-                    extractPCM(fromSSELine: line)
-                }
-
-                if !pendingPCM.isEmpty {
-                    continue
-                }
-            }
-        }
-
-        private mutating func extractPCM(fromSSELine line: Data) {
-            // SSE lines look like: data: {...json...}
-            guard line.count > 6 else { return }
-            let prefix = line.prefix(5)
-            guard String(decoding: prefix, as: UTF8.self) == "data:" ||
-                    String(decoding: line.prefix(6), as: UTF8.self) == "data: " else {
-                // Also accept raw JSON array elements without the SSE prefix.
-                if line.first == 0x7B { // '{'
-                    extractInlineData(fromJSON: line)
-                }
-                return
-            }
-            var jsonData = line.dropFirst(5)
-            if jsonData.first == 0x20 { jsonData = jsonData.dropFirst() } // skip space
-            if jsonData == Data("[DONE]".utf8) { return }
-            extractInlineData(fromJSON: Data(jsonData))
-        }
-
-        private mutating func extractInlineData(fromJSON jsonData: Data) {
-            guard let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-                return
-            }
-            let candidates = json["candidates"] as? [[String: Any]] ?? []
-            for candidate in candidates {
-                guard let content = candidate["content"] as? [String: Any],
-                      let parts = content["parts"] as? [[String: Any]] else {
-                    continue
-                }
-                for part in parts {
-                    if let inlineData = part["inlineData"] as? [String: Any],
-                       let encoded = inlineData["data"] as? String,
-                       let pcm = Data(base64Encoded: encoded),
-                       !pcm.isEmpty {
-                        pendingPCM.append(pcm)
-                        emittedCount += 1
-                    }
-                }
-            }
-        }
-    }
-
-    func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(bytes: bytes)
     }
 }

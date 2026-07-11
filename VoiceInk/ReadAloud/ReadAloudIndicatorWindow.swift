@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 
 /// Tiny floating indicator that shows while a read-aloud session is active.
 ///
@@ -24,6 +25,12 @@ final class ReadAloudIndicatorWindow {
 
     func hide() {
         panel?.orderOut(nil)
+    }
+
+    /// Called on high-frequency playback ticks. Updates the AppKit bar only —
+    /// never goes through SwiftUI observation.
+    func progressDidChange() {
+        contentView?.refreshProgressOnly()
     }
 
     private func initialize() {
@@ -93,8 +100,7 @@ private final class ReadAloudIndicatorContentView: NSView {
     private let fasterButton = NSButton()
     private let playPauseButton = NSButton()
     private let stopButton = NSButton()
-    private let progressBar = NSView()
-    private var progressWidthConstraint: NSLayoutConstraint?
+    private let progressLayer = CALayer()
 
     init(frame: NSRect, manager: ReadAloudManager) {
         self.manager = manager
@@ -162,13 +168,9 @@ private final class ReadAloudIndicatorContentView: NSView {
 
         effectView.addSubview(root)
 
-        progressBar.wantsLayer = true
-        progressBar.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-        progressBar.translatesAutoresizingMaskIntoConstraints = false
-        effectView.addSubview(progressBar)
-
-        let progressWidth = progressBar.widthAnchor.constraint(equalToConstant: 2)
-        progressWidthConstraint = progressWidth
+        progressLayer.backgroundColor = NSColor.controlAccentColor.cgColor
+        progressLayer.frame = CGRect(x: 0, y: 0, width: 2, height: 2)
+        effectView.layer?.addSublayer(progressLayer)
 
         NSLayoutConstraint.activate([
             effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -191,12 +193,7 @@ private final class ReadAloudIndicatorContentView: NSView {
             playPauseButton.widthAnchor.constraint(equalToConstant: 22),
             playPauseButton.heightAnchor.constraint(equalToConstant: 22),
             stopButton.widthAnchor.constraint(equalToConstant: 22),
-            stopButton.heightAnchor.constraint(equalToConstant: 22),
-
-            progressBar.leadingAnchor.constraint(equalTo: effectView.leadingAnchor),
-            progressBar.bottomAnchor.constraint(equalTo: effectView.bottomAnchor),
-            progressBar.heightAnchor.constraint(equalToConstant: 2),
-            progressWidth
+            stopButton.heightAnchor.constraint(equalToConstant: 22)
         ])
 
         toolTip = nil
@@ -220,10 +217,10 @@ private final class ReadAloudIndicatorContentView: NSView {
     }
 
     private func bind(_ manager: ReadAloudManager) {
+        // Only react to coarse state / settings changes — not progress ticks.
         manager.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                // Defer one turn so Published values are updated.
                 DispatchQueue.main.async { self?.refresh() }
             }
             .store(in: &cancellables)
@@ -259,8 +256,19 @@ private final class ReadAloudIndicatorContentView: NSView {
             ? String(localized: "Resume")
             : String(localized: "Pause")
 
-        let width = max(2, bounds.width * CGFloat(manager.progress))
-        progressWidthConstraint?.constant = width
+        refreshProgressOnly()
+    }
+
+    /// Updates only the progress fill via CALayer — no Auto Layout mutation.
+    func refreshProgressOnly() {
+        guard let manager else { return }
+        let totalWidth = effectView.bounds.width
+        guard totalWidth > 0 else { return }
+        let width = max(2, totalWidth * CGFloat(manager.progress))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        progressLayer.frame = CGRect(x: 0, y: 0, width: width, height: 2)
+        CATransaction.commit()
     }
 
     private func statusText(for state: ReadAloudState) -> String {
@@ -297,11 +305,6 @@ private final class ReadAloudIndicatorContentView: NSView {
     @objc private func fasterTapped() { manager?.faster() }
     @objc private func playPauseTapped() { manager?.togglePlayback() }
     @objc private func stopTapped() { manager?.stop() }
-
-    override func layout() {
-        super.layout()
-        refresh()
-    }
 
     /// Allow clicks without first activating the panel (nonactivatingPanel).
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }

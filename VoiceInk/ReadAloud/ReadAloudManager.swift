@@ -29,7 +29,12 @@ final class ReadAloudManager: ObservableObject {
     // MARK: - Published state
 
     @Published private(set) var state: ReadAloudState = .idle
-    @Published private(set) var progress: Double = 0.0
+    /// Playback fraction 0…1. Intentionally NOT `@Published`: cloud/Apple
+    /// providers push this many times per second, and publishing it re-renders
+    /// every SwiftUI observer (settings, menu bar) through macOS 26's
+    /// DesignLibrary path, which has been crashing via MainActor checks.
+    /// The AppKit indicator reads this directly instead.
+    private(set) var progress: Double = 0.0
     @Published private(set) var currentText: String = ""
 
     // MARK: - Dependencies (lazy, so we don't spin up AVFoundation until needed)
@@ -37,7 +42,7 @@ final class ReadAloudManager: ObservableObject {
     private lazy var appleProvider: AppleTTSProvider = {
         let p = AppleTTSProvider()
         p.onProgressUpdate = { [weak self] value in
-            Task { @MainActor in self?.progress = value }
+            Task { @MainActor in self?.setProgress(value) }
         }
         return p
     }()
@@ -45,7 +50,7 @@ final class ReadAloudManager: ObservableObject {
     private lazy var elevenLabsProvider: ElevenLabsTTSProvider = {
         let p = ElevenLabsTTSProvider()
         p.onProgressUpdate = { [weak self] value in
-            Task { @MainActor in self?.progress = value }
+            Task { @MainActor in self?.setProgress(value) }
         }
         return p
     }()
@@ -53,7 +58,7 @@ final class ReadAloudManager: ObservableObject {
     private lazy var openAIProvider: OpenAITTSProvider = {
         let p = OpenAITTSProvider()
         p.onProgressUpdate = { [weak self] value in
-            Task { @MainActor in self?.progress = value }
+            Task { @MainActor in self?.setProgress(value) }
         }
         return p
     }()
@@ -61,7 +66,7 @@ final class ReadAloudManager: ObservableObject {
     private lazy var geminiProvider: GeminiTTSProvider = {
         let p = GeminiTTSProvider()
         p.onProgressUpdate = { [weak self] value in
-            Task { @MainActor in self?.progress = value }
+            Task { @MainActor in self?.setProgress(value) }
         }
         return p
     }()
@@ -69,6 +74,7 @@ final class ReadAloudManager: ObservableObject {
     private var currentProviderRef: TextToSpeechProvider?
     private var playbackTask: Task<Void, Never>?
     private lazy var indicatorWindow: ReadAloudIndicatorWindow = ReadAloudIndicatorWindow(manager: self)
+    private var messagePanel: NSPanel?
 
     private init() {}
 
@@ -88,20 +94,18 @@ final class ReadAloudManager: ObservableObject {
             return
         }
 
-        state = .capturing
-        indicatorWindow.show()
-
+        // Capture text BEFORE publishing state or showing UI. Publishing first
+        // + Accessibility work has been crashing SwiftData @Query layout in the
+        // main window on macOS 26 (MainActor executor check / HIE).
         Task { @MainActor in
-            let text = await SelectedTextService.fetchSelectedText()
+            let text = await SelectedTextService.fetchSelectedTextForReadAloud()
+            // Let the run loop settle after any Accessibility / menu-copy work.
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+
             guard let text, !text.isEmpty else {
                 self.logger.info("readSelectedText: no selection")
-                NotificationManager.shared.showNotification(
-                    title: String(localized: "No text is selected"),
-                    type: .warning,
-                    duration: 2.5
-                )
-                self.state = .idle
-                self.indicatorWindow.hide()
+                self.showReadAloudMessage(String(localized: "No text is selected"))
                 return
             }
             await self.speak(text)
@@ -125,11 +129,7 @@ final class ReadAloudManager: ObservableObject {
         Task { @MainActor in
             let hasAccess = await ScreenCaptureService.requestScreenCapturePermissionRegistration()
             guard hasAccess else {
-                NotificationManager.shared.showNotification(
-                    title: String(localized: "Screen recording permission is required"),
-                    type: .warning,
-                    duration: 4.0
-                )
+                self.showReadAloudMessage(String(localized: "Screen recording permission is required"))
                 self.state = .idle
                 return
             }
@@ -141,21 +141,14 @@ final class ReadAloudManager: ObservableObject {
                 self.state = .idle
             case .succeeded(let text):
                 guard !text.isEmpty else {
-                    NotificationManager.shared.showNotification(
-                        title: String(localized: "No text detected in the selected region"),
-                        type: .warning,
-                        duration: 3.0
-                    )
+                    self.showReadAloudMessage(String(localized: "No text detected in the selected region"))
                     self.state = .idle
                     return
                 }
-                self.indicatorWindow.show()
                 await self.speak(text)
             case .failed(let reason):
-                NotificationManager.shared.showNotification(
-                    title: String(format: String(localized: "Screen capture failed: %@"), reason),
-                    type: .error,
-                    duration: 4.0
+                self.showReadAloudMessage(
+                    String(format: String(localized: "Screen capture failed: %@"), reason)
                 )
                 self.state = .idle
             }
@@ -210,10 +203,70 @@ final class ReadAloudManager: ObservableObject {
         playbackTask = nil
         currentProviderRef?.stop()
         currentProviderRef = nil
-        progress = 0
+        setProgress(0)
         currentText = ""
         state = .idle
         indicatorWindow.hide()
+    }
+
+    /// Updates the playback fraction and refreshes only the AppKit indicator.
+    private func setProgress(_ value: Double) {
+        progress = value
+        indicatorWindow.progressDidChange()
+    }
+
+    /// AppKit-only toast — never mounts SwiftUI/`NSHostingView` (those re-enter
+    /// SwiftData MainActor checks and crash on macOS 26 after Accessibility work).
+    private func showReadAloudMessage(_ message: String) {
+        messagePanel?.orderOut(nil)
+        messagePanel = nil
+
+        let width: CGFloat = 340
+        let height: CGFloat = 44
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
+        box.layer?.cornerRadius = 10
+
+        let label = NSTextField(labelWithString: message)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        box.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            label.centerYAnchor.constraint(equalTo: box.centerYAnchor)
+        ])
+        panel.contentView = box
+
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: visible.midX - width / 2, y: visible.minY + 72))
+        }
+        panel.orderFrontRegardless()
+        messagePanel = panel
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self, weak panel] in
+            panel?.orderOut(nil)
+            if self?.messagePanel === panel {
+                self?.messagePanel = nil
+            }
+        }
     }
 
     /// Rate boundaries exposed here so the indicator can disable buttons at the extremes.
@@ -279,10 +332,8 @@ final class ReadAloudManager: ObservableObject {
                 // Cancelled by stop() — nothing to log.
             } catch {
                 self?.logger.error("read-aloud playback failed: \(error.localizedDescription, privacy: .public)")
-                NotificationManager.shared.showNotification(
-                    title: String(format: String(localized: "Read-aloud failed: %@"), error.localizedDescription),
-                    type: .error,
-                    duration: 4.0
+                self?.showReadAloudMessage(
+                    String(format: String(localized: "Read-aloud failed: %@"), error.localizedDescription)
                 )
             }
 
@@ -290,7 +341,7 @@ final class ReadAloudManager: ObservableObject {
             guard let self else { return }
             if self.currentProviderRef === provider {
                 self.state = .idle
-                self.progress = 0
+                self.setProgress(0)
                 self.currentText = ""
                 self.currentProviderRef = nil
                 self.indicatorWindow.hide()
