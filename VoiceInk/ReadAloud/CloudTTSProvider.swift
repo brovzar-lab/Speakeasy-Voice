@@ -8,6 +8,8 @@ enum CloudTTSError: LocalizedError {
     case invalidResponse
     case httpError(Int, String?)
     case decodingFailed
+    case emptyAudioStream
+    case streamEndedEarly
 
     var errorDescription: String? {
         switch self {
@@ -22,7 +24,109 @@ enum CloudTTSError: LocalizedError {
             return String(format: String(localized: "TTS request failed (%d)."), code)
         case .decodingFailed:
             return String(localized: "Failed to decode TTS audio response.")
+        case .emptyAudioStream:
+            return String(localized: "The TTS provider returned no audio.")
+        case .streamEndedEarly:
+            return String(localized: "The TTS provider ended the audio early.")
         }
+    }
+}
+
+struct GeminiSSEEvent: Equatable, Sendable {
+    let pcm: Data?
+    let finishReason: String?
+}
+
+enum GeminiSSEDecodingError: Error {
+    case malformedEvent
+}
+
+/// Pure SSE event decoder kept outside the MainActor provider so JSON/base64
+/// work can be tested and performed on a background executor.
+enum GeminiSSEEventDecoder {
+    static func decode(_ line: Data) throws -> GeminiSSEEvent? {
+        var payload = line
+        while let first = payload.first, first == 0x20 || first == 0x09 || first == 0x0D {
+            payload.removeFirst()
+        }
+        while let last = payload.last, last == 0x20 || last == 0x09 || last == 0x0D {
+            payload.removeLast()
+        }
+
+        // SSE permits blank separators, comments, and metadata fields alongside
+        // data events. They carry no Gemini JSON payload and should be ignored.
+        if payload.isEmpty
+            || payload.first == 0x3A
+            || payload.starts(with: Data("event:".utf8))
+            || payload.starts(with: Data("id:".utf8))
+            || payload.starts(with: Data("retry:".utf8)) {
+            return nil
+        }
+
+        if payload.starts(with: Data("data:".utf8)) {
+            payload.removeFirst(5)
+            if payload.first == 0x20 { payload.removeFirst() }
+        }
+
+        guard !payload.isEmpty, payload != Data("[DONE]".utf8) else { return nil }
+        guard payload.first == 0x7B,
+              let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let first = candidates.first else {
+            throw GeminiSSEDecodingError.malformedEvent
+        }
+
+        let finishReason = first["finishReason"] as? String ?? first["finish_reason"] as? String
+        let parts = ((first["content"] as? [String: Any])?["parts"] as? [[String: Any]]) ?? []
+        var combined = Data()
+
+        for part in parts {
+            let inlineData = part["inlineData"] as? [String: Any]
+                ?? part["inline_data"] as? [String: Any]
+            guard let encoded = inlineData?["data"] as? String,
+                  let pcm = Data(base64Encoded: encoded) else {
+                continue
+            }
+            combined.append(pcm)
+        }
+
+        return GeminiSSEEvent(
+            pcm: combined.isEmpty ? nil : combined,
+            finishReason: finishReason
+        )
+    }
+}
+
+private final class GeminiStreamMonitor: @unchecked Sendable {
+    private let lock = NSLock()
+    private let startedAt: Date
+    private var byteCount = 0
+    private var storedError: CloudTTSError?
+    private var firstPCMSeconds: TimeInterval?
+
+    init(startedAt: Date) {
+        self.startedAt = startedAt
+    }
+
+    func record(bytes: Int) {
+        lock.lock()
+        if firstPCMSeconds == nil {
+            firstPCMSeconds = Date().timeIntervalSince(startedAt)
+        }
+        byteCount += bytes
+        lock.unlock()
+    }
+
+    func fail(_ error: CloudTTSError) {
+        lock.lock()
+        storedError = error
+        lock.unlock()
+    }
+
+    var result: (bytes: Int, error: CloudTTSError?, firstPCMSeconds: TimeInterval?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (byteCount, storedError, firstPCMSeconds)
     }
 }
 
@@ -127,7 +231,11 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             self.continuation = cont
 
-            self.streamingTask = Task.detached { [weak self] in
+            // The network decoder produces coarse Data chunks off MainActor.
+            // Buffer scheduling stays explicitly on MainActor because AVAudioEngine
+            // is actor-bound. This avoids detached tasks retaining actor objects.
+            self.streamingTask = Task { @MainActor [weak self] in
+                guard let self else { return }
                 var pending = Data()
                 var didStartPlayback = false
 
@@ -148,9 +256,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                             let toPlay = Data(pending.prefix(alignedCount))
                             pending.removeFirst(alignedCount)
                             didStartPlayback = true
-                            await MainActor.run {
-                                self?.scheduleStreamingPCMBuffer(toPlay)
-                            }
+                            self.scheduleStreamingPCMBuffer(toPlay)
                         }
                     }
 
@@ -158,23 +264,16 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         let alignedCount = pending.count - (pending.count % bytesPerFrame)
                         if alignedCount > 0 {
                             let toPlay = Data(pending.prefix(alignedCount))
-                            await MainActor.run {
-                                self?.scheduleStreamingPCMBuffer(toPlay)
-                            }
+                            self.scheduleStreamingPCMBuffer(toPlay)
                         }
                     }
 
-                    await MainActor.run {
-                        guard let self else { return }
-                        self.streamEnded = true
-                        if self.pendingStreamingBuffers == 0 {
-                            self.finishStreamingPlayback()
-                        }
+                    self.streamEnded = true
+                    if self.pendingStreamingBuffers == 0 {
+                        self.finishStreamingPlayback()
                     }
                 } catch {
-                    await MainActor.run {
-                        self?.finishStreamingPlayback()
-                    }
+                    self.finishStreamingPlayback()
                 }
             }
         }
@@ -691,34 +790,51 @@ final class GeminiTTSProvider: TextToSpeechProvider {
 
         let model = ReadAloudSettings.shared.geminiModel
         let voiceName = voice.voiceIdentifier ?? "Kore"
-        let bodyData = try Self.makeRequestBody(text: trimmed, voiceName: voiceName)
-
         let settings = ReadAloudSettings.shared
-        if settings.geminiSupportsStreaming {
-            do {
-                try await speakWithStreaming(
-                    model: model,
-                    bodyData: bodyData,
-                    apiKey: apiKey,
-                    trimmed: trimmed,
-                    voiceName: voiceName,
-                    voice: voice
-                )
-                return
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                logger.warning("Gemini streaming failed, falling back to batch: \(error.localizedDescription, privacy: .public)")
-            }
+        let chunks: [String]
+        if trimmed.count > 1_000, let split = SentenceChunker.chunkIfNeeded(trimmed) {
+            chunks = split
+        } else {
+            chunks = [trimmed]
         }
 
-        try await speakWithBatch(
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let bodyData = try Self.makeRequestBody(text: chunk, voiceName: voiceName)
+
+            if settings.geminiSupportsStreaming {
+                do {
+                    try await speakWithStreaming(
+                        model: model,
+                        bodyData: bodyData,
+                        apiKey: apiKey,
+                        voice: voice
+                    )
+                    continue
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch CloudTTSError.streamEndedEarly {
+                    // Audio may already have played. Replaying the same chunk via
+                    // batch would duplicate speech, so surface a clear error.
+                    throw CloudTTSError.streamEndedEarly
+                } catch {
+                    logger.warning("Gemini streaming failed, falling back to batch: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+
+            try await speakWithBatch(
+                model: model,
+                bodyData: bodyData,
+                apiKey: apiKey,
+                voice: voice
+            )
+        }
+
+        ReadAloudUsageTracker.shared.record(
+            provider: "gemini",
             model: model,
-            bodyData: bodyData,
-            apiKey: apiKey,
-            trimmed: trimmed,
-            voiceName: voiceName,
-            voice: voice
+            voiceId: voiceName,
+            characterCount: trimmed.count
         )
     }
 
@@ -750,8 +866,6 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         model: String,
         bodyData: Data,
         apiKey: String,
-        trimmed: String,
-        voiceName: String,
         voice: VoiceConfiguration
     ) async throws {
         var request = URLRequest(
@@ -767,16 +881,15 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         try Self.checkHTTPStatus(response: response, data: data)
 
         try Task.checkCancellation()
-        guard let pcm = Self.extractPCM(from: data) else {
+        let event: GeminiSSEEvent?
+        do {
+            event = try GeminiSSEEventDecoder.decode(data)
+        } catch {
             throw CloudTTSError.decodingFailed
         }
-
-        ReadAloudUsageTracker.shared.record(
-            provider: "gemini",
-            model: model,
-            voiceId: voiceName,
-            characterCount: trimmed.count
-        )
+        guard let pcm = event?.pcm else {
+            throw CloudTTSError.decodingFailed
+        }
 
         await audioPlayer.play(
             pcmData: pcm,
@@ -784,16 +897,16 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             volume: voice.volume,
             initialRate: voice.rate
         )
+        try Task.checkCancellation()
     }
 
     private func speakWithStreaming(
         model: String,
         bodyData: Data,
         apiKey: String,
-        trimmed: String,
-        voiceName: String,
         voice: VoiceConfiguration
     ) async throws {
+        let requestStart = Date()
         var request = URLRequest(
             url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse")!
         )
@@ -815,28 +928,41 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             let body = String(data: errorData, encoding: .utf8)
             throw CloudTTSError.httpError(http.statusCode, body)
         }
+        logger.notice("[LATENCY] Gemini response-headers duration=\(Date().timeIntervalSince(requestStart), format: .fixed(precision: 3), privacy: .public)s")
 
         try Task.checkCancellation()
-        ReadAloudUsageTracker.shared.record(
-            provider: "gemini",
-            model: model,
-            voiceId: voiceName,
-            characterCount: trimmed.count
-        )
-
-        let pcmStream = Self.decodeGeminiSSEToPCMChunks(bytes)
+        let (pcmStream, monitor) = Self.decodeGeminiSSEToPCMChunks(bytes, startedAt: requestStart)
         await audioPlayer.playStreamingPCM(
             from: pcmStream,
             sampleRate: Self.pcmSampleRate,
             volume: voice.volume,
             initialRate: voice.rate
         )
+        try Task.checkCancellation()
+
+        let result = monitor.result
+        if let firstPCMSeconds = result.firstPCMSeconds {
+            logger.notice("[LATENCY] Gemini first-pcm duration=\(firstPCMSeconds, format: .fixed(precision: 3), privacy: .public)s bytes=\(result.bytes, privacy: .public)")
+        }
+        if let error = result.error {
+            // Once any PCM has been handed to the player, a batch fallback would
+            // repeat words the user already heard. Treat every later decode or
+            // provider failure as an interrupted stream instead.
+            if result.bytes > 0 { throw CloudTTSError.streamEndedEarly }
+            if case .streamEndedEarly = error { throw CloudTTSError.emptyAudioStream }
+            throw error
+        }
+        guard result.bytes > 0 else { throw CloudTTSError.emptyAudioStream }
     }
 
     /// Decode Gemini SSE into PCM `Data` chunks on a background task.
-    private static func decodeGeminiSSEToPCMChunks(_ bytes: URLSession.AsyncBytes) -> AsyncStream<Data> {
-        AsyncStream { continuation in
-            let task = Task {
+    private static func decodeGeminiSSEToPCMChunks(
+        _ bytes: URLSession.AsyncBytes,
+        startedAt: Date
+    ) -> (AsyncStream<Data>, GeminiStreamMonitor) {
+        let monitor = GeminiStreamMonitor(startedAt: startedAt)
+        let stream = AsyncStream<Data> { continuation in
+            let task = Task.detached {
                 var lineBuffer = Data()
                 var networkChunk = Data()
                 networkChunk.reserveCapacity(8_192)
@@ -854,75 +980,42 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                             let line = lineBuffer.subdata(in: lineBuffer.startIndex..<newline)
                             let nextStart = lineBuffer.index(after: newline)
                             lineBuffer.removeSubrange(lineBuffer.startIndex..<nextStart)
-                            if let pcm = extractPCMFromSSELine(line), !pcm.isEmpty {
-                                continuation.yield(pcm)
-                            }
+                            try processGeminiSSELine(line, continuation: continuation, monitor: monitor)
                         }
                     }
 
                     if !networkChunk.isEmpty {
                         lineBuffer.append(networkChunk)
                     }
-                    if !lineBuffer.isEmpty, let pcm = extractPCMFromSSELine(lineBuffer), !pcm.isEmpty {
-                        continuation.yield(pcm)
+                    if !lineBuffer.isEmpty {
+                        try processGeminiSSELine(lineBuffer, continuation: continuation, monitor: monitor)
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
+                    monitor.fail(.decodingFailed)
                     continuation.finish()
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+        return (stream, monitor)
     }
 
-    private static func extractPCMFromSSELine(_ line: Data) -> Data? {
-        guard line.count > 6 else {
-            if line.first == 0x7B { // '{'
-                return extractPCM(from: line)
-            }
-            return nil
+    nonisolated private static func processGeminiSSELine(
+        _ line: Data,
+        continuation: AsyncStream<Data>.Continuation,
+        monitor: GeminiStreamMonitor
+    ) throws {
+        guard let event = try GeminiSSEEventDecoder.decode(line) else { return }
+        if let pcm = event.pcm, !pcm.isEmpty {
+            monitor.record(bytes: pcm.count)
+            continuation.yield(pcm)
         }
-        let prefix5 = String(decoding: line.prefix(5), as: UTF8.self)
-        let prefix6 = String(decoding: line.prefix(6), as: UTF8.self)
-        if prefix5 == "data:" || prefix6 == "data: " {
-            var jsonData = line.dropFirst(5)
-            if jsonData.first == 0x20 { jsonData = jsonData.dropFirst() }
-            if jsonData == Data("[DONE]".utf8) { return nil }
-            return extractPCM(from: Data(jsonData))
+        if event.finishReason == "OTHER" {
+            monitor.fail(.streamEndedEarly)
         }
-        if line.first == 0x7B {
-            return extractPCM(from: line)
-        }
-        return nil
-    }
-
-    private static func extractPCM(from data: Data) -> Data? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            return nil
-        }
-
-        var combined = Data()
-        for part in parts {
-            guard let inlineData = inlineDataDict(from: part),
-                  let encoded = inlineData["data"] as? String,
-                  let pcm = Data(base64Encoded: encoded),
-                  !pcm.isEmpty else {
-                continue
-            }
-            combined.append(pcm)
-        }
-        return combined.isEmpty ? nil : combined
-    }
-
-    /// Gemini may return camelCase (`inlineData`) or snake_case (`inline_data`).
-    private static func inlineDataDict(from part: [String: Any]) -> [String: Any]? {
-        if let dict = part["inlineData"] as? [String: Any] { return dict }
-        if let dict = part["inline_data"] as? [String: Any] { return dict }
-        return nil
     }
 
     private static func checkHTTPStatus(response: URLResponse, data: Data) throws {

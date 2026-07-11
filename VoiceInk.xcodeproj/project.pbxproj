@@ -574,7 +574,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VoiceInk.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VoiceInk";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Speakeasy-Voice.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Speakeasy-Voice";
 			};
 			name = Debug;
 		};
@@ -592,7 +592,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VoiceInk.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VoiceInk";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Speakeasy-Voice.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Speakeasy-Voice";
 			};
 			name = Release;
 		};

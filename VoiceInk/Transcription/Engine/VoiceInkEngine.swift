@@ -334,27 +334,28 @@ class VoiceInkEngine: NSObject, ObservableObject {
                                 _ = realtimeAudioGate.reset()
                             }
 
-                            Task { @MainActor [weak self] in
-                                guard let self else { return }
+                            if !self.serviceRegistry.shouldUseRealtimeTranscription(for: transcriptionConfiguration) {
+                                Task { @MainActor [weak self] in
+                                    guard let self else { return }
 
-                                let currentModel = ModeRuntimeResolver.transcriptionConfiguration(
-                                    transcriptionModelManager: self.transcriptionModelManager
-                                )?.model
+                                    let currentModel = ModeRuntimeResolver.transcriptionConfiguration(
+                                        transcriptionModelManager: self.transcriptionModelManager
+                                    )?.model
 
-                                if let model = currentModel,
-                                   model.provider == .whisper {
-                                    if let localWhisperModel = self.whisperModelManager.availableModels.first(where: { $0.name == model.name }),
-                                       self.whisperModelManager.whisperContext == nil {
-                                        do {
-                                            try await self.whisperModelManager.loadModel(localWhisperModel)
-                                        } catch {
-                                            self.logger.error("❌ Model loading failed: \(error, privacy: .public)")
+                                    if let model = currentModel,
+                                       model.provider == .whisper {
+                                        if let localWhisperModel = self.whisperModelManager.availableModels.first(where: { $0.name == model.name }),
+                                           self.whisperModelManager.whisperContext == nil {
+                                            do {
+                                                try await self.whisperModelManager.loadModel(localWhisperModel)
+                                            } catch {
+                                                self.logger.error("❌ Model loading failed: \(error, privacy: .public)")
+                                            }
                                         }
+                                    } else if let fluidAudioModel = currentModel as? FluidAudioModel {
+                                        try? await self.serviceRegistry.fluidAudioTranscriptionService.loadModel(for: fluidAudioModel)
                                     }
-                                } else if let fluidAudioModel = currentModel as? FluidAudioModel {
-                                    try? await self.serviceRegistry.fluidAudioTranscriptionService.loadModel(for: fluidAudioModel)
                                 }
-
                             }
 
                         } catch {

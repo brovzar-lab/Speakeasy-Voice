@@ -64,6 +64,7 @@ class TranscriptionPipeline {
         onDismiss: @escaping () async -> Void,
         assistant: AssistantHooks = .inactive
     ) async {
+        let pipelineStart = Date()
         let model = transcriptionConfiguration.model
         var finalText: String?
         var didInsertSessionMetric = false
@@ -113,6 +114,7 @@ class TranscriptionPipeline {
             }
             text = TranscriptionOutputFilter.filter(text)
             let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
+            logger.notice("[LATENCY] transcription model=\(model.displayName, privacy: .public) duration=\(transcriptionDuration, format: .fixed(precision: 3), privacy: .public)s chars=\(text.count, privacy: .public)")
 
             if shouldCancel() { await finishCanceledTranscription(); return }
 
@@ -193,6 +195,7 @@ class TranscriptionPipeline {
                         transcription.aiRequestSystemMessage = enhancementService.lastSystemMessageSent
                         transcription.aiRequestUserMessage = enhancementService.lastUserMessageSent
                         finalText = enhancedText
+                        logger.notice("[LATENCY] enhancement duration=\(enhancementDuration, format: .fixed(precision: 3), privacy: .public)s chars=\(enhancedText.count, privacy: .public)")
                     } catch {
                         let errorDescription = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                         transcription.enhancedText = String(format: String(localized: "Enhancement failed: %@"), errorDescription)
@@ -257,6 +260,7 @@ class TranscriptionPipeline {
             return
         }
 
+        let deliveryStart = Date()
         await delivery.deliver(
             TranscriptionDelivery.Request(
                 transcription: transcription,
@@ -274,6 +278,7 @@ class TranscriptionPipeline {
                 failResponse: assistant.failResponse
             )
         )
+        logger.notice("[LATENCY] delivery-post duration=\(Date().timeIntervalSince(deliveryStart), format: .fixed(precision: 3), privacy: .public)s pipeline-total=\(Date().timeIntervalSince(pipelineStart), format: .fixed(precision: 3), privacy: .public)s")
 
         saveTranscriptionAndPostCompletion()
     }

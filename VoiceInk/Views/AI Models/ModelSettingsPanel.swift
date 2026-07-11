@@ -87,7 +87,7 @@ private struct EnhancementModelSettingsView: View {
     @AppStorage("SkipShortEnhancement") private var isSkipShortEnhancementEnabled = true
     @AppStorage("ShortEnhancementWordThreshold") private var shortEnhancementWordThreshold = 3
     @AppStorage("EnhancementTimeoutSeconds") private var enhancementTimeoutSeconds = 7
-    @AppStorage("EnhancementRetryOnTimeout") private var retryOnTimeout = true
+    @AppStorage("EnhancementRetryOnTimeout") private var retryOnTimeout = false
     @State private var isShortEnhancementExpanded = false
 
     var body: some View {

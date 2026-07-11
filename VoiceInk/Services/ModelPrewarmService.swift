@@ -1,5 +1,4 @@
 import Foundation
-import SwiftData
 import os
 import AppKit
 
@@ -7,20 +6,22 @@ import AppKit
 final class ModelPrewarmService: ObservableObject {
     private let transcriptionModelManager: TranscriptionModelManager
     private let whisperModelManager: WhisperModelManager
-    private let modelContext: ModelContext
+    private let serviceRegistry: TranscriptionServiceRegistry
+    private let canPrewarm: @MainActor () -> Bool
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "ModelPrewarm")
-    private lazy var serviceRegistry = TranscriptionServiceRegistry(
-        modelProvider: whisperModelManager,
-        modelsDirectory: whisperModelManager.modelsDirectory,
-        modelContext: modelContext
-    )
-    private let prewarmAudioURL = Bundle.main.url(forResource: "sound7", withExtension: "wav")
     private let prewarmEnabledKey = "PrewarmModelOnWake"
+    private var prewarmTask: Task<Void, Never>?
 
-    init(transcriptionModelManager: TranscriptionModelManager, whisperModelManager: WhisperModelManager, modelContext: ModelContext) {
+    init(
+        transcriptionModelManager: TranscriptionModelManager,
+        whisperModelManager: WhisperModelManager,
+        serviceRegistry: TranscriptionServiceRegistry,
+        canPrewarm: @escaping @MainActor () -> Bool
+    ) {
         self.transcriptionModelManager = transcriptionModelManager
         self.whisperModelManager = whisperModelManager
-        self.modelContext = modelContext
+        self.serviceRegistry = serviceRegistry
+        self.canPrewarm = canPrewarm
         setupNotifications()
         schedulePrewarmOnAppLaunch()
     }
@@ -46,28 +47,30 @@ final class ModelPrewarmService: ObservableObject {
     /// Trigger on app launch (cold start)
     private func schedulePrewarmOnAppLaunch() {
         logger.notice("App launched, scheduling prewarm")
-        Task {
+        schedulePrewarmTask()
+    }
+
+    private func schedulePrewarmTask() {
+        prewarmTask?.cancel()
+        prewarmTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
-            await performPrewarm()
+            guard !Task.isCancelled, let self else { return }
+            await self.performPrewarm()
         }
     }
 
     /// Trigger on wake from sleep or screen unlock
     @objc private func schedulePrewarm() {
         logger.notice("Mac activity detected (wake/unlock), scheduling prewarm")
-        Task {
-            try? await Task.sleep(for: .seconds(3))
-            await performPrewarm()
-        }
+        schedulePrewarmTask()
     }
 
     // MARK: - Core Prewarming Logic
 
     private func performPrewarm() async {
         guard shouldPrewarm() else { return }
-
-        guard let audioURL = prewarmAudioURL else {
-            logger.error("❌ Prewarm audio file (sound7.wav) not found")
+        guard canPrewarm() else {
+            logger.notice("App is busy, skipping prewarm")
             return
         }
 
@@ -83,11 +86,22 @@ final class ModelPrewarmService: ObservableObject {
         let startTime = Date()
 
         do {
-            let _ = try await serviceRegistry.transcribe(
-                audioURL: audioURL,
-                model: currentModel,
-                context: transcriptionConfiguration.requestContext
-            )
+            switch currentModel.provider {
+            case .whisper:
+                guard let model = whisperModelManager.availableModels.first(where: { $0.name == currentModel.name }) else {
+                    throw VoiceInkEngineError.modelLoadFailed
+                }
+                if whisperModelManager.loadedWhisperModel?.name != model.name || whisperModelManager.whisperContext == nil {
+                    try await whisperModelManager.loadModel(model)
+                }
+            case .fluidAudio:
+                guard let model = currentModel as? FluidAudioModel else {
+                    throw VoiceInkEngineError.modelLoadFailed
+                }
+                try await serviceRegistry.fluidAudioTranscriptionService.loadModel(for: model)
+            default:
+                return
+            }
             let duration = Date().timeIntervalSince(startTime)
 
             logger.notice("Prewarm completed in \(String(format: "%.2f", duration), privacy: .public)s")
@@ -124,6 +138,7 @@ final class ModelPrewarmService: ObservableObject {
     }
 
     deinit {
+        prewarmTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         logger.notice("ModelPrewarmService deinitialized")
     }

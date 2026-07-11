@@ -11,6 +11,7 @@ class FluidAudioTranscriptionService: TranscriptionService {
     private var activeNemotronModelName: String?
     private var cachedModels: AsrModels?
     private var loadingTask: (version: AsrModelVersion, task: Task<AsrModels, Error>)?
+    private var managerLoadingTask: (modelName: String, task: Task<Void, Error>)?
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "FluidAudioTranscriptionService")
 
     private func version(for model: any TranscriptionModel) -> AsrModelVersion {
@@ -49,6 +50,10 @@ class FluidAudioTranscriptionService: TranscriptionService {
 
         let manager = AsrManager(config: .default)
         try await manager.loadModels(models)
+        guard !Task.isCancelled else {
+            await manager.cleanup()
+            throw CancellationError()
+        }
         self.asrManager = manager
         self.activeVersion = version
     }
@@ -62,6 +67,10 @@ class FluidAudioTranscriptionService: TranscriptionService {
 
         let manager = UnifiedAsrManager(encoderPrecision: FluidAudioModelManager.parakeetUnifiedPrecision)
         try await manager.loadModels()
+        guard !Task.isCancelled else {
+            await manager.cleanup()
+            throw CancellationError()
+        }
         self.unifiedAsrManager = manager
     }
 
@@ -74,6 +83,10 @@ class FluidAudioTranscriptionService: TranscriptionService {
 
         let manager = StreamingNemotronMultilingualAsrManager()
         try await manager.loadModels(from: FluidAudioModelManager.nemotronCacheDirectory(for: modelName))
+        guard !Task.isCancelled else {
+            await manager.cleanup()
+            throw CancellationError()
+        }
         self.nemotronAsrManager = manager
         self.activeNemotronModelName = modelName
     }
@@ -115,8 +128,28 @@ class FluidAudioTranscriptionService: TranscriptionService {
     }
 
     func loadModel(for model: FluidAudioModel) async throws {
+        if let inFlight = managerLoadingTask {
+            try await inFlight.task.value
+            if inFlight.modelName == model.name { return }
+        }
+
+        let modelName = model.name
+        let task = Task { [weak self] in
+            guard let self else { return }
+            try await self.loadModelWithoutDeduplication(for: model)
+        }
+        managerLoadingTask = (modelName, task)
+        defer {
+            if managerLoadingTask?.modelName == modelName {
+                managerLoadingTask = nil
+            }
+        }
+        try await task.value
+    }
+
+    private func loadModelWithoutDeduplication(for model: FluidAudioModel) async throws {
         if FluidAudioModelManager.isNemotronModel(named: model.name) {
-            // Realtime Nemotron uses a dedicated streaming manager; batch loads lazily in transcribe().
+            try await ensureNemotronModelsLoaded(named: model.name)
             return
         }
 
@@ -129,8 +162,12 @@ class FluidAudioTranscriptionService: TranscriptionService {
     }
 
     func transcribe(audioURL: URL, model: any TranscriptionModel, context: TranscriptionRequestContext) async throws -> String {
+        guard let fluidModel = model as? FluidAudioModel else {
+            throw VoiceInkEngineError.modelLoadFailed
+        }
+
         if FluidAudioModelManager.isParakeetUnifiedModel(named: model.name) {
-            try await ensureUnifiedModelsLoaded()
+            try await loadModel(for: fluidModel)
             guard let unifiedAsrManager else {
                 throw ASRError.notInitialized
             }
@@ -141,7 +178,7 @@ class FluidAudioTranscriptionService: TranscriptionService {
         }
 
         if FluidAudioModelManager.isNemotronModel(named: model.name) {
-            try await ensureNemotronModelsLoaded(named: model.name)
+            try await loadModel(for: fluidModel)
             guard let nemotronAsrManager else {
                 throw ASRError.notInitialized
             }
@@ -167,8 +204,7 @@ class FluidAudioTranscriptionService: TranscriptionService {
             return TextNormalizer.shared.normalizeSentence(text)
         }
 
-        let targetVersion = version(for: model)
-        try await ensureModelsLoaded(for: targetVersion)
+        try await loadModel(for: fluidModel)
 
         guard let asrManager = asrManager else {
             throw ASRError.notInitialized
@@ -251,6 +287,10 @@ class FluidAudioTranscriptionService: TranscriptionService {
 
     // Releases ASR/VAD resources but preserves cached models for reuse
     func cleanup() async {
+        let pendingLoad = managerLoadingTask?.task
+        pendingLoad?.cancel()
+        managerLoadingTask = nil
+        _ = try? await pendingLoad?.value
         await cleanupLoadedManagers()
     }
 

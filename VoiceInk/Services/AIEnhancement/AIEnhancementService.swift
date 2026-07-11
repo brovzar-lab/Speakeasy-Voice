@@ -339,7 +339,7 @@ class AIEnhancementService: ObservableObject {
         text: String,
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot?,
-        maxRetries: Int = 3,
+        maxRetries: Int = 2,
         initialDelay: TimeInterval = 1.0
     ) async throws -> String {
         var retries = 0

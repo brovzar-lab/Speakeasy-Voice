@@ -61,6 +61,7 @@ class WhisperModelManager: ObservableObject {
     @Published var isModelLoaded = false
     @Published var loadedWhisperModel: WhisperModelFile?
     @Published var isModelLoading = false
+    private var loadingTask: (modelName: String, task: Task<Void, Error>)?
 
     let modelsDirectory: URL
     let whisperPrompt = WhisperPrompt()
@@ -104,19 +105,47 @@ class WhisperModelManager: ObservableObject {
     // MARK: - Model Loading
 
     func loadModel(_ model: WhisperModelFile) async throws {
-        guard whisperContext == nil else { return }
+        if whisperContext != nil, loadedWhisperModel?.name == model.name { return }
 
+        if let loadingTask {
+            try await loadingTask.task.value
+            if whisperContext != nil, loadedWhisperModel?.name == model.name { return }
+        }
+
+        await whisperContext?.releaseResources()
+        whisperContext = nil
+        isModelLoaded = false
+        loadedWhisperModel = nil
         isModelLoading = true
-        defer { isModelLoading = false }
+
+        let modelName = model.name
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let context = try await WhisperContext.createContext(path: model.url.path)
+            guard !Task.isCancelled else {
+                await context.releaseResources()
+                throw CancellationError()
+            }
+            let currentPrompt = UserDefaults.standard.string(forKey: "TranscriptionPrompt") ?? self.whisperPrompt.transcriptionPrompt
+            await context.setPrompt(currentPrompt)
+            guard !Task.isCancelled else {
+                await context.releaseResources()
+                throw CancellationError()
+            }
+            self.whisperContext = context
+            self.isModelLoaded = true
+            self.loadedWhisperModel = model
+        }
+        loadingTask = (modelName, task)
+        defer {
+            if loadingTask?.modelName == modelName {
+                loadingTask = nil
+                isModelLoading = false
+            }
+        }
 
         do {
-            whisperContext = try await WhisperContext.createContext(path: model.url.path)
-
-            let currentPrompt = UserDefaults.standard.string(forKey: "TranscriptionPrompt") ?? whisperPrompt.transcriptionPrompt
-            await whisperContext?.setPrompt(currentPrompt)
-
-            isModelLoaded = true
-            loadedWhisperModel = model
+            try await task.value
         } catch {
             throw VoiceInkEngineError.modelLoadFailed
         }
@@ -315,7 +344,12 @@ class WhisperModelManager: ObservableObject {
     }
 
     func unloadModel() {
+        let pendingLoad = loadingTask?.task
+        pendingLoad?.cancel()
+        loadingTask = nil
+        isModelLoading = false
         Task {
+            _ = try? await pendingLoad?.value
             await whisperContext?.releaseResources()
             whisperContext = nil
             isModelLoaded = false
@@ -339,6 +373,11 @@ class WhisperModelManager: ObservableObject {
     /// Does NOT call serviceRegistry.cleanup() — that is VoiceInkEngine's responsibility.
     func cleanupResources() async {
         logger.notice("WhisperModelManager.cleanupResources: releasing whisper context")
+        let pendingLoad = loadingTask?.task
+        pendingLoad?.cancel()
+        loadingTask = nil
+        isModelLoading = false
+        _ = try? await pendingLoad?.value
         await whisperContext?.releaseResources()
         whisperContext = nil
         isModelLoaded = false

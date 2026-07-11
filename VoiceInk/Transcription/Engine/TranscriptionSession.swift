@@ -1,6 +1,22 @@
 import Foundation
 import os
 
+enum StreamingStartupBarrier {
+    @MainActor
+    static func waitUntilReady(
+        timeout: TimeInterval,
+        pollInterval: Duration = .milliseconds(25),
+        isPending: @escaping @MainActor () -> Bool
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while isPending(), Date() < deadline {
+            try Task.checkCancellation()
+            try await Task.sleep(for: pollInterval)
+        }
+        return !isPending()
+    }
+}
+
 /// Encapsulates a single recording-to-transcription lifecycle (streaming or file-based).
 @MainActor
 protocol TranscriptionSession: AnyObject {
@@ -50,6 +66,8 @@ final class FileTranscriptionSession: TranscriptionSession {
 /// Streaming session with automatic fallback to file-based upload on failure.
 @MainActor
 final class StreamingTranscriptionSession: TranscriptionSession {
+    nonisolated static let startupBarrierTimeout: TimeInterval = 2.0
+
     private let streamingService: StreamingTranscriptionService
     private let fallbackService: TranscriptionService
     private var model: (any TranscriptionModel)?
@@ -115,6 +133,28 @@ final class StreamingTranscriptionSession: TranscriptionSession {
     func transcribe(audioURL: URL) async throws -> String {
         guard let model = model else {
             throw VoiceInkEngineError.transcriptionFailed
+        }
+
+        // Short recordings can end while the model/WebSocket is still connecting.
+        // Wait for that in-flight startup instead of immediately treating
+        // `.connecting` as a failure and retranscribing the whole file in batch.
+        if startupTask != nil {
+            let waitStart = Date()
+            let didBecomeReady = try await StreamingStartupBarrier.waitUntilReady(
+                timeout: Self.startupBarrierTimeout,
+                isPending: { [weak self] in self?.startupTask != nil }
+            )
+
+            if !didBecomeReady {
+                logger.warning("Streaming startup timed out after \(Self.startupBarrierTimeout, format: .fixed(precision: 1), privacy: .public)s; using batch fallback")
+                startupTask?.cancel()
+                startupTask = nil
+                startupTaskID = nil
+                streamingService.cancel()
+                streamingFailed = true
+            } else {
+                logger.notice("Streaming startup barrier finished elapsed=\(Date().timeIntervalSince(waitStart), format: .fixed(precision: 3), privacy: .public)s failed=\(self.streamingFailed, privacy: .public)")
+            }
         }
 
         if !streamingFailed {
