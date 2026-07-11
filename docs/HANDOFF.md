@@ -21,7 +21,7 @@ One human UI check, then merge the PR:
 1. `cd ~/CODE/SPEAKEASY-VOICE && make local && open ~/Downloads/Speakeasy-Voice.app`
 2. Select a short paragraph → Read Aloud (Gemini should already be selected)
 3. Confirm speech starts in a couple seconds and clicking Speakeasy UI does not crash
-4. Merge the open PR into `main` (link in Open loops / git)
+4. Merge PR #1 into `main`: https://github.com/brovzar-lab/Speakeasy-Voice/pull/1
 
 If step 3 fails, do **not** re-disable streaming; capture whether it fails on load, during speak, or on click, and reopen from `docs/HANDOFF.md`.
 
@@ -40,7 +40,7 @@ If step 3 fails, do **not** re-disable streaming; capture whether it fails on lo
 None blocking. Optional follow-ups only:
 
 1. **Human UI confirm** — one Gemini Read Aloud pass in the app (API already green). Done when Billy says “works” or reports a failure mode.
-2. **Merge PR** — branch ready; merge when UI confirm is good (or when Billy says merge anyway).
+2. **Merge PR #1** — https://github.com/brovzar-lab/Speakeasy-Voice/pull/1 — merge when UI confirm is good (or when Billy says merge anyway).
 
 ## How to run and verify
 
