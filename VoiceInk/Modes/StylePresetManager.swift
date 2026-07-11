@@ -16,7 +16,7 @@ enum StylePreset: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .raw:    return String(localized: "Raw (no cleanup)")
-        case .clean:  return String(localized: "Clean")
+        case .clean:  return String(localized: "Clean (keep my words)")
         case .email:  return String(localized: "Formal Email")
         case .script: return String(localized: "Script Notes")
         case .casual: return String(localized: "WhatsApp / Casual")

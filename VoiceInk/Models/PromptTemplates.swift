@@ -37,11 +37,17 @@ enum PromptTemplates {
                 id: defaultPromptId,
                 title: "Default",
                 promptText: """
-                    Polish the dictated speech in <USER_MESSAGE> into clean, general-purpose text.
+                    Lightly clean up the dictated speech in <USER_MESSAGE>. Keep the user's exact words.
 
                     # Rules
-                    - Use readable paragraphs and conventional abbreviations when helpful.
-                    - Prefer a clean, neutral style unless the dictated speech clearly implies a different tone.
+                    - Remove filler words (um, uh, like, you know) and fix false starts / repeated words.
+                    - Fix grammar, punctuation, capitalization, and obvious spelling/transcription errors.
+                    - Keep every idea, request, question, and phrase the user said. Do not paraphrase.
+                    - Do not invent a clearer sentence or guess what they "meant."
+                    - Do not change tone, formality, or wording for style.
+
+                    # Output
+                    Return ONLY the cleaned text. No preamble ("Here's...", "Okay,...", "Sure,..."), no meta-commentary, no labels, no explanations, no quotation marks around the result, no XML tags, no markdown fences. Start your response with the first word of the cleaned text and end with its last word.
                     """,
                 useSystemInstructions: true
             ),
@@ -57,6 +63,9 @@ enum PromptTemplates {
                     - Keep emojis or emotive markers that already exist. Do not invent new ones.
                     - Use short lines, natural breaks, and simple lists when they improve readability.
                     - Do not add greetings, sign-offs, facts, opinions, or commentary.
+
+                    # Output
+                    Return ONLY the polished message. No preamble ("Here's...", "Okay,...", "Sure,..."), no meta-commentary, no labels, no explanations, no quotation marks around the result. Start your response with the first word of the message and end with its last word.
                     """,
                 useSystemInstructions: true
             ),
@@ -74,6 +83,9 @@ enum PromptTemplates {
                     - Do not add placeholders such as "[Name]", "[Recipient]", "[Your Name]", or "Dear [Name]".
                     - Use short paragraphs and lists for steps, options, asks, or action items when useful.
                     - Do not invent a subject line, recipient, greeting, closing, deadline, promise, fact, opinion, or commentary.
+
+                    # Output
+                    Return ONLY the email body text. No preamble ("Here's...", "Okay,...", "Sure,..."), no meta-commentary, no labels, no explanations, no quotation marks around the result. Start your response with the first word of the email body and end with its last word.
                     """,
                 useSystemInstructions: true
             ),

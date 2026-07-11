@@ -11,6 +11,9 @@ enum ShortcutAction: Hashable {
     case quickAddToDictionary
     case toggleDictationLanguage
     case cycleDictationStyle
+    case readSelectedText
+    case readScreenRegion
+    case stopReading
     case mode(UUID)
     case recorderPanelEscape
     case recorderPanelMode(Int)
@@ -50,6 +53,12 @@ enum ShortcutAction: Hashable {
             return "toggleDictationLanguage"
         case .cycleDictationStyle:
             return "cycleDictationStyle"
+        case .readSelectedText:
+            return "readSelectedText"
+        case .readScreenRegion:
+            return "readScreenRegion"
+        case .stopReading:
+            return "stopReading"
         case .mode(let id):
             return "mode_\(id.uuidString)"
         case .recorderPanelEscape:
@@ -81,6 +90,12 @@ enum ShortcutAction: Hashable {
             return String(localized: "Toggle Dictation Language (EN/ES)")
         case .cycleDictationStyle:
             return String(localized: "Cycle Dictation Style")
+        case .readSelectedText:
+            return String(localized: "Read Selected Text")
+        case .readScreenRegion:
+            return String(localized: "Read Screen Region")
+        case .stopReading:
+            return String(localized: "Stop Reading")
         case .mode(let id):
             if let config = ModeManager.shared.getConfiguration(with: id) {
                 return String(format: String(localized: "%@ Mode"), config.name)
@@ -105,7 +120,10 @@ enum ShortcutAction: Hashable {
         .openHistoryWindow,
         .quickAddToDictionary,
         .toggleDictationLanguage,
-        .cycleDictationStyle
+        .cycleDictationStyle,
+        .readSelectedText,
+        .readScreenRegion,
+        .stopReading
     ]
 
     static let recorderPanelStoredActions: [Self] = [

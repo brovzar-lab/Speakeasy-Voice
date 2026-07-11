@@ -11,15 +11,7 @@ struct DashboardView: View {
         DashboardContent(
             modelContext: modelContext,
             licenseState: licenseViewModel.licenseState,
-            onAddLicenseKey: navigateToLicenseManagement
-        )
-    }
-
-    private func navigateToLicenseManagement() {
-        NotificationCenter.default.post(
-            name: .navigateToDestination,
-            object: nil,
-            userInfo: ["destination": "Speakeasy-Voice Pro"]
+            onAddLicenseKey: {}
         )
     }
 }

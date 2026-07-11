@@ -110,6 +110,27 @@ struct SettingsView: View {
                         .controlSize(.small)
                 }
 
+                LabeledContent("Read Selected Text") {
+                    ShortcutRecorder(action: .readSelectedText) {
+                        recordingShortcutManager.updateShortcutStatus()
+                    }
+                        .controlSize(.small)
+                }
+
+                LabeledContent("Read Screen Region") {
+                    ShortcutRecorder(action: .readScreenRegion) {
+                        recordingShortcutManager.updateShortcutStatus()
+                    }
+                        .controlSize(.small)
+                }
+
+                LabeledContent("Stop Reading") {
+                    ShortcutRecorder(action: .stopReading) {
+                        recordingShortcutManager.updateShortcutStatus()
+                    }
+                        .controlSize(.small)
+                }
+
                 Toggle("Double-tap Fn (Globe key) to start / stop dictation", isOn: $recordingShortcutManager.isFnDoubleTapEnabled)
 
                 LabeledContent("Cancel Recording") {

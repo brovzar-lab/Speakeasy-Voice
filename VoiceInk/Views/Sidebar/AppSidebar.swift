@@ -21,7 +21,15 @@ struct AppSidebar: View {
             sidebarSection(ViewType.primaryItems)
                 .padding(.top, 10)
 
-            Spacer(minLength: 16)
+            Spacer(minLength: 12)
+
+            // Read Aloud spend widget — visible cost/budget summary always in view
+            // so the user can see spend accumulating without opening the tab.
+            ReadAloudUsageWidget(style: .compact) {
+                selectedView = .readAloud
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 12)
 
             sidebarSection(ViewType.secondaryItems)
                 .padding(.bottom, 14)
@@ -57,28 +65,35 @@ struct AppSidebar: View {
 }
 
 private extension ViewType {
+    /// Sidebar label. The `rawValue` is kept stable for navigation-notification
+    /// routing (external calls like `openMainWindowAndNavigate(to: "Modes")`
+    /// still work), while this override controls the visible text.
     var title: LocalizedStringKey {
         switch self {
         case .transcribeAudio:
             return "Transcribe"
+        case .modes:
+            return "Dictation Modes"
         default:
             return LocalizedStringKey(rawValue)
         }
     }
 
+    /// Sidebar order: primary flows near the top, secondary reference sections
+    /// (Dictionary, History) at the bottom of the primary group.
     static let primaryItems: [ViewType] = [
         .dashboard,
         .modes,
+        .readAloud,
         .transcribeAudio,
-        .history,
-        .dictionary,
         .models,
-        .audio
+        .audio,
+        .dictionary,
+        .history
     ]
 
     static let secondaryItems: [ViewType] = [
-        .settings,
-        .license
+        .settings
     ]
 
     static func assertSidebarItemsCoverAllCases() {
@@ -97,8 +112,8 @@ private extension ViewType {
         case .modes: return "sparkles.square.fill.on.square"
         case .audio: return "mic.fill"
         case .dictionary: return "text.book.closed.fill"
+        case .readAloud: return "speaker.wave.2.fill"
         case .settings: return "gearshape.fill"
-        case .license: return "checkmark.seal.fill"
         }
     }
 
@@ -118,10 +133,10 @@ private extension ViewType {
             return .init(background: AppTheme.Sidebar.audio)
         case .transcribeAudio:
             return .init(background: AppTheme.Sidebar.transcribeAudio)
+        case .readAloud:
+            return .init(background: AppTheme.Sidebar.readAloud)
         case .settings:
             return .init(background: AppTheme.Sidebar.fallback)
-        case .license:
-            return .init(background: AppTheme.Sidebar.license)
         }
     }
 }

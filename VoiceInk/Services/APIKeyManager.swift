@@ -31,10 +31,17 @@ final class APIKeyManager {
     // MARK: - Standard Provider API Keys
 
     /// Saves an API key for a provider.
+    ///
+    /// Always trims surrounding whitespace / newlines. Pasting a key from a
+    /// webpage frequently drags a trailing `\n` along, and that newline ends
+    /// up in the `Authorization: Bearer ...` header — every request then 401s
+    /// against an otherwise valid key. This is the single defensive fix that
+    /// prevents that class of bug.
     @discardableResult
     func saveAPIKey(_ key: String, forProvider provider: String) -> Bool {
+        let cleaned = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let keyIdentifier = keychainIdentifier(forProvider: provider)
-        let success = keychain.save(key, forKey: keyIdentifier)
+        let success = keychain.save(cleaned, forKey: keyIdentifier)
         if success {
             logger.info("Saved API key for provider: \(provider, privacy: .public) with key: \(keyIdentifier, privacy: .public)")
         }
@@ -42,9 +49,14 @@ final class APIKeyManager {
     }
 
     /// Retrieves an API key for a provider.
+    ///
+    /// Also trims on the way out so historical keys saved before the save-side
+    /// trim was in place still work without a manual re-save.
     func getAPIKey(forProvider provider: String) -> String? {
         let keyIdentifier = keychainIdentifier(forProvider: provider)
-        return keychain.getString(forKey: keyIdentifier)
+        guard let raw = keychain.getString(forKey: keyIdentifier) else { return nil }
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     /// Deletes an API key for a provider.

@@ -11,8 +11,9 @@ struct DashboardContent: View {
     private static let displayNameMinWidth: CGFloat = 72
     private static let displayNameMaxWidth: CGFloat = 280
     private static let displayNameHorizontalPadding: CGFloat = 8
-    private static let insightsUnlockDuration: TimeInterval = 30 * 60
-    private static let peakHoursUnlockDuration: TimeInterval = 30 * 60
+    // Personal build: no usage threshold — insights and peak hours are always available.
+    private static let insightsUnlockDuration: TimeInterval = 0
+    private static let peakHoursUnlockDuration: TimeInterval = 0
     // Above this count, skip live auto-refresh (full reload is expensive); tab reopen still refreshes.
     private static let automaticStatsRefreshMetricLimit = 2_000
     private static let statsRefreshDebounceNanoseconds: UInt64 = 750_000_000

@@ -390,9 +390,32 @@ class VoiceInkEngine: NSObject, ObservableObject {
     private func startRecordingContextCapture() {
         clearActiveRecordingContext()
 
+        guard let enhancementService,
+              let aiService = enhancementService.getAIService() else {
+            return
+        }
+
+        let enhancementConfiguration = ModeRuntimeResolver.currentEnhancementConfiguration(
+            enhancementService: enhancementService,
+            aiService: aiService
+        )
+        guard enhancementConfiguration.isEnabled else { return }
+
+        var options = RecordingContextCaptureOptions()
+        if enhancementConfiguration.useClipboardContext {
+            options.insert(.clipboard)
+        }
+        if enhancementConfiguration.useSelectedTextContext {
+            options.insert(.selectedText)
+        }
+        if enhancementConfiguration.useScreenCaptureContext {
+            options.insert(.screen)
+        }
+        guard !options.isEmpty else { return }
+
         let store = RecordingContextSnapshotStore()
         activeRecordingContextStore = store
-        activeRecordingContextTasks = RecordingContextCaptureService.startCapture(into: store)
+        activeRecordingContextTasks = RecordingContextCaptureService.startCapture(into: store, options: options)
     }
 
     private func clearActiveRecordingContext() {
@@ -670,11 +693,14 @@ class VoiceInkEngine: NSObject, ObservableObject {
     }
 
     func cleanupResources() async {
-        logger.notice("cleanupResources: releasing model resources")
+        let keepModelLoaded = UserDefaults.standard.object(forKey: "KeepTranscriptionModelLoaded") as? Bool ?? true
+        logger.notice("cleanupResources: releasing model resources (keepLoaded=\(keepModelLoaded, privacy: .public))")
         activeRecordingStartID = nil
         activeRecordingUseCase = .newSession
-        await whisperModelManager.cleanupResources()
-        await serviceRegistry.cleanup()
+        if !keepModelLoaded {
+            await whisperModelManager.cleanupResources()
+            await serviceRegistry.cleanup()
+        }
         logger.notice("cleanupResources: completed")
     }
 

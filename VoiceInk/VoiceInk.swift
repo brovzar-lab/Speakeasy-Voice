@@ -99,6 +99,8 @@ struct VoiceInkApp: App {
 
         // Seed the style-preset cleanup prompts (Clean / Email / Script Notes / Casual).
         Self.seedStylePresetsIfNeeded(enhancementService: enhancementService)
+        // Bump the Default (Clean) prompt to minimal-cleanup wording for existing installs.
+        Self.migrateMinimalCleanupPromptIfNeeded(enhancementService: enhancementService)
 
         // 1. Create modelsDirectory URL
         let appSupportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -363,6 +365,25 @@ struct VoiceInkApp: App {
                     - Do not add commentary, greetings, or invented details.
                     """,
                 useSystemInstructions: true))
+        }
+        enhancementService.customPrompts = prompts
+        UserDefaults.standard.set(true, forKey: key)
+    }
+
+    /// One-time bump of the built-in Default (Clean) prompt to the minimal-cleanup
+    /// wording. Overwrites only that known seed id so user-created prompts stay intact.
+    private static func migrateMinimalCleanupPromptIfNeeded(enhancementService: AIEnhancementService) {
+        let key = "hasMigratedMinimalCleanupPrompt_v1"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        guard let seed = PromptTemplates.seedPrompts.first(where: { $0.id == PromptTemplates.defaultPromptId }) else {
+            return
+        }
+
+        var prompts = enhancementService.customPrompts
+        if let index = prompts.firstIndex(where: { $0.id == PromptTemplates.defaultPromptId }) {
+            prompts[index] = seed
+        } else {
+            prompts.append(seed)
         }
         enhancementService.customPrompts = prompts
         UserDefaults.standard.set(true, forKey: key)

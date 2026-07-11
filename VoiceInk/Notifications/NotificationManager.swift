@@ -76,7 +76,9 @@ class NotificationManager {
             withTimeInterval: duration,
             repeats: false
         ) { [weak self] _ in
-            self?.dismissNotification()
+            Task { @MainActor in
+                self?.dismissNotification()
+            }
         }
     }
 
@@ -112,8 +114,9 @@ class NotificationManager {
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             window.animator().alphaValue = 0
         }, completionHandler: {
-            window.close()
-
+            Task { @MainActor in
+                window.close()
+            }
         })
     }
 } 
