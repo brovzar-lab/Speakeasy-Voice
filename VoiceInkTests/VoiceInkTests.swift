@@ -207,4 +207,229 @@ struct VoiceInkTests {
         #expect(AppVersionDisplay.text(version: "1.5") == "Version 1.5")
     }
 
+    @Test func geminiRetriesTransientInternalErrorAndReturnsAudio() async throws {
+        var attempts = 0
+        var delays: [TimeInterval] = []
+
+        let audio: Data = try await CloudTTSRetryPolicy.run(
+            jitter: { $0 },
+            sleep: { delays.append($0) },
+            operation: { _ in
+                attempts += 1
+                if attempts < 3 {
+                    throw CloudTTSError.httpError(
+                        500,
+                        #"{"error":{"code":500,"status":"INTERNAL"}}"#
+                    )
+                }
+                return Data([0x01, 0x02])
+            }
+        )
+
+        #expect(audio == Data([0x01, 0x02]))
+        #expect(attempts == 3)
+        #expect(delays == [0.5, 1.5])
+    }
+
+    @Test func geminiInternalErrorUsesConfiguredElevenLabsFallback() {
+        let fallback = ReadAloudFallbackPolicy.resolve(
+            primary: .gemini,
+            preferred: .elevenlabs,
+            isEnabled: true,
+            configuredProviders: [.elevenlabs, .openai],
+            error: .httpError(500, #"{"error":{"status":"INTERNAL"}}"#)
+        )
+
+        #expect(fallback == .elevenlabs)
+    }
+
+    @Test func partialAudioFailureNeverRestartsSelectionWithFallback() {
+        let fallback = ReadAloudFallbackPolicy.resolve(
+            primary: .gemini,
+            preferred: .elevenlabs,
+            isEnabled: true,
+            configuredProviders: [.elevenlabs],
+            error: .streamEndedEarly
+        )
+
+        #expect(fallback == nil)
+
+        let authenticationFallback = ReadAloudFallbackPolicy.resolve(
+            primary: .gemini,
+            preferred: .elevenlabs,
+            isEnabled: true,
+            configuredProviders: [.elevenlabs],
+            error: .httpError(401, "UNAUTHENTICATED")
+        )
+        #expect(authenticationFallback == nil)
+    }
+
+    @Test func rawProviderJSONIsNotShownToUser() {
+        let message = ReadAloudErrorPresentation.message(
+            provider: .gemini,
+            error: CloudTTSError.httpError(
+                500,
+                #"{"error":{"code":500,"message":"An internal error has occurred","status":"INTERNAL"}}"#
+            )
+        )
+
+        #expect(message == "Gemini is temporarily unavailable. Please try again.")
+        #expect(!message.contains("{\"error\""))
+    }
+
+    @Test func selectedTextQueuePreservesReadingOrder() {
+        var queue = ReadAloudTextQueue()
+        queue.enqueue("First selection")
+        queue.enqueue("Second selection")
+
+        #expect(queue.count == 2)
+        #expect(queue.dequeue() == "First selection")
+        #expect(queue.dequeue() == "Second selection")
+        #expect(queue.dequeue() == nil)
+    }
+
+    @Test func geminiDoesNotRetryInvalidRequest() async {
+        var attempts = 0
+        do {
+            let _: Data = try await CloudTTSRetryPolicy.run(
+                jitter: { $0 },
+                sleep: { _ in },
+                operation: { _ in
+                    attempts += 1
+                    throw CloudTTSError.httpError(400, "INVALID_ARGUMENT")
+                }
+            )
+            Issue.record("A 400 response must fail without retrying")
+        } catch {
+            #expect(attempts == 1)
+        }
+    }
+
+    @Test func cancellingGeminiRetryStopsImmediately() async {
+        let task = Task<Data, Error> {
+            try await CloudTTSRetryPolicy.run(
+                jitter: { _ in 10 },
+                operation: { _ in
+                    throw CloudTTSError.httpError(500, "INTERNAL")
+                }
+            )
+        }
+
+        try? await Task.sleep(for: .milliseconds(20))
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("Cancellation must stop pending Gemini retries")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            Issue.record("Expected CancellationError, received \(error)")
+        }
+    }
+
+    @Test func geminiBatchRequestRetriesInternalResponsesAndDecodesAudio() async throws {
+        let url = try #require(URL(string: "https://example.test/gemini"))
+        let request = URLRequest(url: url)
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let expectedPCM = Data([0x01, 0x02, 0x03, 0x04])
+        let successBody = Data(
+            #"{"candidates":[{"content":{"parts":[{"inlineData":{"data":"AQIDBA=="}}]}}]}"#.utf8
+        )
+
+        let pcm = try await GeminiBatchRequestExecutor.fetchPCM(
+            request: request,
+            jitter: { $0 },
+            sleep: { delays.append($0) },
+            transport: { _ in
+                attempts += 1
+                if attempts < 3 {
+                    let response = try #require(HTTPURLResponse(
+                        url: url,
+                        statusCode: 500,
+                        httpVersion: nil,
+                        headerFields: nil
+                    ))
+                    return (Data(#"{"error":{"status":"INTERNAL"}}"#.utf8), response)
+                }
+                let response = try #require(HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                ))
+                return (successBody, response)
+            }
+        )
+
+        #expect(pcm == expectedPCM)
+        #expect(attempts == 3)
+        #expect(delays == [0.5, 1.5])
+    }
+
+    @Test func fallbackStartsOnlyAfterGeminiRetriesAreExhausted() async throws {
+        var geminiAttempts = 0
+        var fallbackAttemptCount: Int?
+        var spokenProviders: [ReadAloudProvider] = []
+
+        let finalProvider = try await ReadAloudPlaybackRecovery.run(
+            primary: .gemini,
+            preferredFallback: .elevenlabs,
+            fallbackEnabled: true,
+            configuredProviders: [.elevenlabs],
+            onFallback: { _ in fallbackAttemptCount = geminiAttempts },
+            speak: { provider in
+                spokenProviders.append(provider)
+                if provider == .gemini {
+                    let _: Data = try await CloudTTSRetryPolicy.run(
+                        jitter: { $0 },
+                        sleep: { _ in },
+                        operation: { _ in
+                            geminiAttempts += 1
+                            throw CloudTTSError.httpError(500, "INTERNAL")
+                        }
+                    )
+                }
+            }
+        )
+
+        #expect(finalProvider == .elevenlabs)
+        #expect(geminiAttempts == 3)
+        #expect(fallbackAttemptCount == 3)
+        #expect(spokenProviders == [.gemini, .elevenlabs])
+    }
+
+    @Test func cancellingGeminiRecoveryPreventsFallback() async {
+        var fallbackCalls = 0
+        let task = Task<ReadAloudProvider, Error> {
+            try await ReadAloudPlaybackRecovery.run(
+                primary: .gemini,
+                preferredFallback: .elevenlabs,
+                fallbackEnabled: true,
+                configuredProviders: [.elevenlabs],
+                onFallback: { _ in fallbackCalls += 1 },
+                speak: { provider in
+                    if provider == .elevenlabs { return }
+                    let _: Data = try await CloudTTSRetryPolicy.run(
+                        jitter: { _ in 10 },
+                        operation: { _ in
+                            throw CloudTTSError.httpError(500, "INTERNAL")
+                        }
+                    )
+                }
+            )
+        }
+
+        try? await Task.sleep(for: .milliseconds(20))
+        task.cancel()
+        _ = try? await task.value
+
+        #expect(fallbackCalls == 0)
+    }
+
+    @Test func geminiStreamingAndBatchFallbackShareThreeRequestBudget() {
+        #expect(GeminiAttemptBudget.maximumStreamingThenBatchRequests == 3)
+    }
+
 }

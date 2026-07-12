@@ -13,6 +13,7 @@ struct ReadAloudSettingsView: View {
     @State private var openAIAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "openai") ?? ""
     @State private var geminiAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "gemini") ?? ""
     @State private var sampleText: String = String(localized: "The quick brown fox jumps over the lazy dog. This is what the selected voice sounds like.")
+    @State private var voiceSearch: String = ""
 
     @State private var openAIKeyStatus: KeyStatus = .unknown
     @State private var elevenLabsKeyStatus: KeyStatus = .unknown
@@ -50,12 +51,25 @@ struct ReadAloudSettingsView: View {
                             .font(.system(size: 12).monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(width: 42, alignment: .trailing)
+                        }
+                }
+
+                Toggle("Enqueue Selected Text", isOn: $settings.enqueueSelectedText)
+
+                Toggle("Automatic Backup Voice", isOn: $settings.automaticFallbackEnabled)
+
+                if settings.automaticFallbackEnabled {
+                    Picker("Backup Provider", selection: $settings.fallbackProvider) {
+                        ForEach(ReadAloudProvider.allCases.filter { $0 != settings.provider }) { provider in
+                            Text(provider.displayName).tag(provider)
+                        }
                     }
+                    .pickerStyle(.menu)
                 }
             } header: {
                 Text("Playback")
             } footer: {
-                Text("Trigger read-aloud with the shortcuts on the Settings page.")
+                Text("Queued selections play in order. If a cloud provider fails before audio starts, Speakeasy retries and can continue with the backup provider.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -105,9 +119,14 @@ struct ReadAloudSettingsView: View {
             openAIAPIKey = APIKeyManager.shared.getAPIKey(forProvider: "openai") ?? ""
             geminiAPIKey = APIKeyManager.shared.getAPIKey(forProvider: "gemini") ?? ""
             reconcileOpenAIVoice()
+            reconcileFallbackProvider()
         }
         .onChange(of: settings.openAIModel) { _, _ in
             reconcileOpenAIVoice()
+        }
+        .onChange(of: settings.provider) { _, _ in
+            voiceSearch = ""
+            reconcileFallbackProvider()
         }
     }
 
@@ -115,14 +134,21 @@ struct ReadAloudSettingsView: View {
 
     private var appleSection: some View {
         Section {
-            Picker("Voice", selection: appleVoiceBinding) {
-                Text("System Default").tag(String?.none)
-                ForEach(voiceCatalog.entries) { entry in
-                    Text("\(entry.name) — \(entry.language) (\(entry.qualityLabel))")
-                        .tag(Optional(entry.id))
+            TextField("Search voices", text: $voiceSearch)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Picker("Voice", selection: appleVoiceBinding) {
+                    Text("System Default").tag(String?.none)
+                    ForEach(filteredAppleVoices) { entry in
+                        Text("\(entry.name) — \(entry.language) (\(entry.qualityLabel))")
+                            .tag(Optional(entry.id))
+                    }
                 }
+                .pickerStyle(.menu)
+
+                voicePreviewButton
             }
-            .pickerStyle(.menu)
 
             LabeledContent("Pitch") {
                 HStack {
@@ -200,13 +226,17 @@ struct ReadAloudSettingsView: View {
             }
             .pickerStyle(.menu)
 
+            TextField("Search common voices", text: $voiceSearch)
+                .textFieldStyle(.roundedBorder)
+
             LabeledContent("Common Voices") {
-                Menu("Quick Pick") {
-                    Button("Rachel (default female)") { settings.elevenLabsVoiceId = "21m00Tcm4TlvDq8ikWAM" }
-                    Button("Adam (male)") { settings.elevenLabsVoiceId = "pNInz6obpgDQGcFmaJgB" }
-                    Button("Bella (female)") { settings.elevenLabsVoiceId = "EXAVITQu4vr4xnSDxMaL" }
-                    Button("Antoni (male)") { settings.elevenLabsVoiceId = "ErXwobaYiN019PkySvjV" }
-                    Button("Domi (female)") { settings.elevenLabsVoiceId = "AZnzlk1XvdvUeBnXmlld" }
+                HStack {
+                    Menu("Quick Pick") {
+                        ForEach(filteredElevenLabsVoices) { voice in
+                            Button(voice.displayName) { settings.elevenLabsVoiceId = voice.id }
+                        }
+                    }
+                    voicePreviewButton
                 }
             }
         } header: {
@@ -245,12 +275,18 @@ struct ReadAloudSettingsView: View {
             }
             .pickerStyle(.menu)
 
-            Picker("Voice", selection: $settings.openAIVoice) {
-                ForEach(OpenAITTSVoices.voices(for: settings.openAIModel)) { voice in
-                    Text(voice.displayName).tag(voice.id)
+            TextField("Search voices", text: $voiceSearch)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Picker("Voice", selection: $settings.openAIVoice) {
+                    ForEach(filteredOpenAIVoices) { voice in
+                        Text(voice.displayName).tag(voice.id)
+                    }
                 }
+                .pickerStyle(.menu)
+                voicePreviewButton
             }
-            .pickerStyle(.menu)
         } header: {
             Text("OpenAI TTS")
         } footer: {
@@ -287,12 +323,19 @@ struct ReadAloudSettingsView: View {
             }
             .pickerStyle(.menu)
 
-            Picker("Voice", selection: $settings.geminiVoice) {
-                ForEach(GeminiTTSVoices.all) { voice in
-                    Text(voice.displayName).tag(voice.id)
+            TextField("Search voices", text: $voiceSearch)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Picker("Voice", selection: $settings.geminiVoice) {
+                    ForEach(filteredGeminiVoices) { voice in
+                        Text(voice.displayName).tag(voice.id)
+                    }
                 }
+                .pickerStyle(.menu)
+
+                voicePreviewButton
             }
-            .pickerStyle(.menu)
 
             Button {
                 if let url = URL(string: "https://aistudio.google.com/app/apikey") {
@@ -318,6 +361,72 @@ struct ReadAloudSettingsView: View {
         if !supported.contains(settings.openAIVoice), let first = supported.first {
             settings.openAIVoice = first
         }
+    }
+
+    private func reconcileFallbackProvider() {
+        guard settings.fallbackProvider == settings.provider else { return }
+        let cloudOrder: [ReadAloudProvider] = [.elevenlabs, .openai, .gemini]
+        settings.fallbackProvider = cloudOrder.first { $0 != settings.provider } ?? .elevenlabs
+    }
+
+    private var filteredGeminiVoices: [GeminiTTSVoices.Voice] {
+        let query = voiceSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return GeminiTTSVoices.all }
+        let matches = GeminiTTSVoices.all.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+                || $0.id.localizedCaseInsensitiveContains(query)
+        }
+        if matches.contains(where: { $0.id == settings.geminiVoice }) {
+            return matches
+        }
+        if let selected = GeminiTTSVoices.all.first(where: { $0.id == settings.geminiVoice }) {
+            return [selected] + matches
+        }
+        return matches
+    }
+
+    private var filteredAppleVoices: [AppleVoiceCatalog.VoiceEntry] {
+        let query = voiceSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return voiceCatalog.entries }
+        let matches = voiceCatalog.entries.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.language.localizedCaseInsensitiveContains(query)
+                || $0.qualityLabel.localizedCaseInsensitiveContains(query)
+        }
+        guard let selectedID = settings.appleVoiceIdentifier,
+              let selected = voiceCatalog.entries.first(where: { $0.id == selectedID }),
+              !matches.contains(selected) else { return matches }
+        return [selected] + matches
+    }
+
+    private var filteredOpenAIVoices: [OpenAITTSVoices.Voice] {
+        let voices = OpenAITTSVoices.voices(for: settings.openAIModel)
+        let query = voiceSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return voices }
+        let matches = voices.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+                || $0.id.localizedCaseInsensitiveContains(query)
+        }
+        guard let selected = voices.first(where: { $0.id == settings.openAIVoice }),
+              !matches.contains(selected) else { return matches }
+        return [selected] + matches
+    }
+
+    private var filteredElevenLabsVoices: [ElevenLabsQuickVoices.Voice] {
+        let query = voiceSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return ElevenLabsQuickVoices.all }
+        return ElevenLabsQuickVoices.all.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var voicePreviewButton: some View {
+        Button {
+            manager.preview(text: sampleText)
+        } label: {
+            Label("Preview", systemImage: "play.fill")
+        }
+        .disabled(manager.state != .idle)
     }
 
 
@@ -434,6 +543,23 @@ struct ReadAloudSettingsView: View {
             geminiKeyStatus = .failed(error.localizedDescription)
         }
     }
+}
+
+// MARK: - ElevenLabs quick voice catalog
+
+enum ElevenLabsQuickVoices {
+    struct Voice: Identifiable, Hashable {
+        let id: String
+        let displayName: String
+    }
+
+    static let all: [Voice] = [
+        Voice(id: "21m00Tcm4TlvDq8ikWAM", displayName: "Rachel (default female)"),
+        Voice(id: "pNInz6obpgDQGcFmaJgB", displayName: "Adam (male)"),
+        Voice(id: "EXAVITQu4vr4xnSDxMaL", displayName: "Bella (female)"),
+        Voice(id: "ErXwobaYiN019PkySvjV", displayName: "Antoni (male)"),
+        Voice(id: "AZnzlk1XvdvUeBnXmlld", displayName: "Domi (female)")
+    ]
 }
 
 // MARK: - OpenAI voice/model compatibility

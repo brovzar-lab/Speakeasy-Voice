@@ -18,6 +18,110 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
         case .gemini:     return String(localized: "Gemini TTS")
         }
     }
+
+    var shortName: String {
+        switch self {
+        case .apple: return "Apple"
+        case .elevenlabs: return "ElevenLabs"
+        case .openai: return "OpenAI"
+        case .gemini: return "Gemini"
+        }
+    }
+}
+
+enum ReadAloudFallbackPolicy {
+    static func resolve(
+        primary: ReadAloudProvider,
+        preferred: ReadAloudProvider,
+        isEnabled: Bool,
+        configuredProviders: Set<ReadAloudProvider>,
+        error: CloudTTSError
+    ) -> ReadAloudProvider? {
+        guard isEnabled, error.isTransient, isSafeToRestart(after: error) else { return nil }
+
+        var candidates = [preferred, .elevenlabs, .openai]
+        var seen = Set<ReadAloudProvider>()
+        candidates = candidates.filter { seen.insert($0).inserted }
+        return candidates.first { $0 != primary && configuredProviders.contains($0) }
+    }
+
+    private static func isSafeToRestart(after error: CloudTTSError) -> Bool {
+        if case .streamEndedEarly = error { return false }
+        return true
+    }
+}
+
+enum ReadAloudPlaybackRecovery {
+    static func run(
+        primary: ReadAloudProvider,
+        preferredFallback: ReadAloudProvider,
+        fallbackEnabled: Bool,
+        configuredProviders: Set<ReadAloudProvider>,
+        onFallback: (ReadAloudProvider) -> Void,
+        speak: (ReadAloudProvider) async throws -> Void
+    ) async throws -> ReadAloudProvider {
+        do {
+            try await speak(primary)
+            return primary
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as CloudTTSError {
+            guard let fallback = ReadAloudFallbackPolicy.resolve(
+                primary: primary,
+                preferred: preferredFallback,
+                isEnabled: fallbackEnabled,
+                configuredProviders: configuredProviders,
+                error: error
+            ) else {
+                throw error
+            }
+            try Task.checkCancellation()
+            onFallback(fallback)
+            try await speak(fallback)
+            return fallback
+        }
+    }
+}
+
+enum ReadAloudErrorPresentation {
+    static func message(provider: ReadAloudProvider, error: Error) -> String {
+        guard let cloudError = error as? CloudTTSError else {
+            return "\(provider.shortName) could not read this selection. Please try again."
+        }
+
+        switch cloudError {
+        case .httpError(let code, _) where code == 408 || code == 429 || (500...599).contains(code):
+            return "\(provider.shortName) is temporarily unavailable. Please try again."
+        case .streamEndedEarly:
+            return "\(provider.shortName) stopped before finishing. Try a shorter selection."
+        case .missingAPIKey:
+            return "\(provider.shortName) needs an API key in Read Aloud settings."
+        default:
+            return "\(provider.shortName) could not read this selection. Please try again."
+        }
+    }
+}
+
+struct ReadAloudTextQueue {
+    private var items: [String] = []
+
+    var count: Int { items.count }
+    var isEmpty: Bool { items.isEmpty }
+
+    mutating func enqueue(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        items.append(trimmed)
+    }
+
+    mutating func dequeue() -> String? {
+        guard !items.isEmpty else { return nil }
+        return items.removeFirst()
+    }
+
+    mutating func clear() {
+        items.removeAll()
+    }
 }
 
 /// User-configurable read-aloud preferences, persisted to `UserDefaults`.
@@ -39,6 +143,9 @@ final class ReadAloudSettings: ObservableObject {
         static let geminiModel = "readAloud.geminiModel"
         static let rate = "readAloud.rate"
         static let pitch = "readAloud.pitch"
+        static let automaticFallbackEnabled = "readAloud.automaticFallbackEnabled"
+        static let fallbackProvider = "readAloud.fallbackProvider"
+        static let enqueueSelectedText = "readAloud.enqueueSelectedText"
     }
 
     @Published var provider: ReadAloudProvider {
@@ -89,6 +196,18 @@ final class ReadAloudSettings: ObservableObject {
         didSet { UserDefaults.standard.set(pitch, forKey: Keys.pitch) }
     }
 
+    @Published var automaticFallbackEnabled: Bool {
+        didSet { UserDefaults.standard.set(automaticFallbackEnabled, forKey: Keys.automaticFallbackEnabled) }
+    }
+
+    @Published var fallbackProvider: ReadAloudProvider {
+        didSet { UserDefaults.standard.set(fallbackProvider.rawValue, forKey: Keys.fallbackProvider) }
+    }
+
+    @Published var enqueueSelectedText: Bool {
+        didSet { UserDefaults.standard.set(enqueueSelectedText, forKey: Keys.enqueueSelectedText) }
+    }
+
     private init() {
         let defaults = UserDefaults.standard
         self.provider = ReadAloudProvider(rawValue: defaults.string(forKey: Keys.provider) ?? "") ?? .apple
@@ -119,10 +238,21 @@ final class ReadAloudSettings: ObservableObject {
         self.rate = storedRate ?? 1.0
         let storedPitch = defaults.object(forKey: Keys.pitch) as? Float
         self.pitch = storedPitch ?? 1.0
+        self.automaticFallbackEnabled = defaults.bool(forKey: Keys.automaticFallbackEnabled)
+        self.fallbackProvider = ReadAloudProvider(
+            rawValue: defaults.string(forKey: Keys.fallbackProvider) ?? ""
+        ) ?? .elevenlabs
+        self.enqueueSelectedText = defaults.object(forKey: Keys.enqueueSelectedText) == nil
+            ? true
+            : defaults.bool(forKey: Keys.enqueueSelectedText)
     }
 
     /// Build a `VoiceConfiguration` for the active provider.
     func makeVoiceConfiguration() -> VoiceConfiguration {
+        makeVoiceConfiguration(for: provider)
+    }
+
+    func makeVoiceConfiguration(for provider: ReadAloudProvider) -> VoiceConfiguration {
         switch provider {
         case .apple:
             return VoiceConfiguration(

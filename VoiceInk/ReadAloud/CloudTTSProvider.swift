@@ -30,6 +30,122 @@ enum CloudTTSError: LocalizedError {
             return String(localized: "The TTS provider ended the audio early.")
         }
     }
+
+    var isTransient: Bool {
+        switch self {
+        case .httpError(let code, _):
+            return code == 408 || code == 429 || (500...599).contains(code)
+        case .missingAPIKey, .invalidResponse, .decodingFailed, .emptyAudioStream, .streamEndedEarly:
+            return false
+        }
+    }
+
+    var httpStatusCode: Int? {
+        if case .httpError(let code, _) = self { return code }
+        return nil
+    }
+}
+
+/// Retries only temporary cloud synthesis failures. The operation receives a
+/// one-based attempt number so providers can include it in diagnostics.
+enum CloudTTSRetryPolicy {
+    static let retryDelays: [TimeInterval] = [0.5, 1.5]
+
+    static func run<T>(
+        retryDelays: [TimeInterval] = CloudTTSRetryPolicy.retryDelays,
+        jitter: (TimeInterval) -> TimeInterval = { base in
+            base * Double.random(in: 0.85...1.15)
+        },
+        onAttempt: (Int) -> Void = { _ in },
+        onRetry: (Int, TimeInterval, CloudTTSError) -> Void = { _, _, _ in },
+        onFailure: (Int, CloudTTSError) -> Void = { _, _ in },
+        sleep: (TimeInterval) async throws -> Void = { seconds in
+            try await Task.sleep(for: .seconds(seconds))
+        },
+        operation: (Int) async throws -> T
+    ) async throws -> T {
+        for attempt in 1...(retryDelays.count + 1) {
+            try Task.checkCancellation()
+            onAttempt(attempt)
+            do {
+                return try await operation(attempt)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as CloudTTSError {
+                guard error.isTransient, attempt <= retryDelays.count else {
+                    onFailure(attempt, error)
+                    throw error
+                }
+                let delay = max(0, jitter(retryDelays[attempt - 1]))
+                onRetry(attempt, delay, error)
+                try await sleep(delay)
+            } catch let error as URLError {
+                if error.code == .cancelled { throw CancellationError() }
+                throw error
+            }
+        }
+        throw CloudTTSError.invalidResponse
+    }
+}
+
+enum GeminiAttemptBudget {
+    static let streamingRetryDelays: [TimeInterval] = [0.5]
+    static let batchAfterStreamingRetryDelays: [TimeInterval] = []
+    static var maximumStreamingThenBatchRequests: Int {
+        (streamingRetryDelays.count + 1) + (batchAfterStreamingRetryDelays.count + 1)
+    }
+}
+
+/// Testable transport boundary for Gemini's non-streaming TTS endpoint.
+enum GeminiBatchRequestExecutor {
+    static func fetchPCM(
+        request: URLRequest,
+        retryDelays: [TimeInterval] = CloudTTSRetryPolicy.retryDelays,
+        jitter: (TimeInterval) -> TimeInterval = { base in
+            base * Double.random(in: 0.85...1.15)
+        },
+        onAttempt: (Int) -> Void = { _ in },
+        onRetry: (Int, TimeInterval, CloudTTSError) -> Void = { _, _, _ in },
+        onFailure: (Int, CloudTTSError) -> Void = { _, _ in },
+        sleep: (TimeInterval) async throws -> Void = { seconds in
+            try await Task.sleep(for: .seconds(seconds))
+        },
+        transport: (URLRequest) async throws -> (Data, URLResponse) = { request in
+            try await URLSession.shared.data(for: request)
+        }
+    ) async throws -> Data {
+        try await CloudTTSRetryPolicy.run(
+            retryDelays: retryDelays,
+            jitter: jitter,
+            onAttempt: onAttempt,
+            onRetry: onRetry,
+            onFailure: onFailure,
+            sleep: sleep,
+            operation: { _ in
+                let (data, response) = try await transport(request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw CloudTTSError.invalidResponse
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    throw CloudTTSError.httpError(
+                        http.statusCode,
+                        String(data: data, encoding: .utf8)
+                    )
+                }
+
+                let event: GeminiSSEEvent?
+                do {
+                    event = try GeminiSSEEventDecoder.decode(data)
+                } catch {
+                    throw CloudTTSError.decodingFailed
+                }
+                guard let pcm = event?.pcm else {
+                    throw CloudTTSError.decodingFailed
+                }
+                return pcm
+            }
+        )
+    }
 }
 
 struct GeminiSSEEvent: Equatable, Sendable {
@@ -468,7 +584,10 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         if shouldFlush {
                             let toPlay = Data(pending.prefix(alignedCount))
                             pending.removeFirst(alignedCount)
-                            didStartPlayback = true
+                            if !didStartPlayback {
+                                didStartPlayback = true
+                                self.onProgress?(0)
+                            }
                             self.scheduleStreamingPCMBuffer(toPlay)
                         }
                     }
@@ -1012,6 +1131,7 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             chunks = [trimmed]
         }
 
+        var batchRetryDelays = CloudTTSRetryPolicy.retryDelays
         if settings.geminiSupportsStreaming {
             do {
                 let bodies = try chunks.map { try Self.makeRequestBody(text: $0, voiceName: voiceName) }
@@ -1034,8 +1154,13 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                 // Audio may already have played. Replaying the selection via
                 // batch would duplicate speech, so surface a clear error.
                 throw CloudTTSError.streamEndedEarly
-            } catch {
+            } catch let error as CloudTTSError where error.isTransient {
                 logger.warning("Gemini streaming failed before playback, falling back to continuous batch playback: \(error.localizedDescription, privacy: .public)")
+                // Streaming already used two attempts. One batch attempt keeps
+                // the entire Gemini request budget capped at three.
+                batchRetryDelays = GeminiAttemptBudget.batchAfterStreamingRetryDelays
+            } catch {
+                throw error
             }
         }
 
@@ -1044,7 +1169,8 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             model: model,
             bodyDatas: bodies,
             apiKey: apiKey,
-            voice: voice
+            voice: voice,
+            retryDelays: batchRetryDelays
         )
 
         ReadAloudUsageTracker.shared.record(
@@ -1083,16 +1209,20 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         model: String,
         bodyDatas: [Data],
         apiKey: String,
-        voice: VoiceConfiguration
+        voice: VoiceConfiguration,
+        retryDelays: [TimeInterval]
     ) async throws {
         var combinedPCM = Data()
 
-        for bodyData in bodyDatas {
+        for (index, bodyData) in bodyDatas.enumerated() {
             try Task.checkCancellation()
             combinedPCM.append(try await batchPCM(
                 model: model,
                 bodyData: bodyData,
-                apiKey: apiKey
+                apiKey: apiKey,
+                chunkIndex: index,
+                chunkCount: bodyDatas.count,
+                retryDelays: retryDelays
             ))
         }
 
@@ -1109,7 +1239,10 @@ final class GeminiTTSProvider: TextToSpeechProvider {
     private func batchPCM(
         model: String,
         bodyData: Data,
-        apiKey: String
+        apiKey: String,
+        chunkIndex: Int,
+        chunkCount: Int,
+        retryDelays: [TimeInterval]
     ) async throws -> Data {
         var request = URLRequest(
             url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
@@ -1120,21 +1253,19 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         request.timeoutInterval = 120
         request.httpBody = bodyData
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try Self.checkHTTPStatus(response: response, data: data)
-
-        try Task.checkCancellation()
-        let event: GeminiSSEEvent?
-        do {
-            event = try GeminiSSEEventDecoder.decode(data)
-        } catch {
-            throw CloudTTSError.decodingFailed
-        }
-        guard let pcm = event?.pcm else {
-            throw CloudTTSError.decodingFailed
-        }
-
-        return pcm
+        return try await GeminiBatchRequestExecutor.fetchPCM(
+            request: request,
+            retryDelays: retryDelays,
+            onAttempt: { [logger] attempt in
+                logger.notice("Gemini batch request model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt, privacy: .public) bytesPlayed=0")
+            },
+            onRetry: { [logger] attempt, delay, error in
+                logger.warning("Gemini batch retry model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt + 1, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=0 delay=\(delay, format: .fixed(precision: 2), privacy: .public)s")
+            },
+            onFailure: { [logger] attempt, error in
+                logger.error("Gemini batch failed model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=0")
+            }
+        )
     }
 
     private func speakWithStreaming(
@@ -1159,7 +1290,9 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                 let (chunkSegment, chunkMonitor) = try await self.streamingPCMStream(
                     model: model,
                     bodyData: bodyDatas[index],
-                    apiKey: apiKey
+                    apiKey: apiKey,
+                    chunkIndex: index,
+                    chunkCount: bodyDatas.count
                 )
 
                 return PCMStreamSegment(
@@ -1206,37 +1339,55 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         if let firstPCMSeconds = result.firstPCMSeconds {
             logger.notice("[LATENCY] Gemini first-pcm duration=\(firstPCMSeconds, format: .fixed(precision: 3), privacy: .public)s bytes=\(result.bytes, privacy: .public)")
         }
-        if let error = result.error { throw error }
+        if let error = result.error {
+            logger.error("Gemini stream failed model=\(model, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=\(result.bytes, privacy: .public)")
+            throw error
+        }
         guard result.bytes > 0 else { throw CloudTTSError.emptyAudioStream }
     }
 
     private func streamingPCMStream(
         model: String,
         bodyData: Data,
-        apiKey: String
+        apiKey: String,
+        chunkIndex: Int,
+        chunkCount: Int
     ) async throws -> (PCMStreamSegment, GeminiStreamMonitor) {
         let requestStart = Date()
-        var request = URLRequest(
-            url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse")!
-        )
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 120
-        request.httpBody = bodyData
+        let (bytes, _) = try await CloudTTSRetryPolicy.run(
+            retryDelays: GeminiAttemptBudget.streamingRetryDelays,
+            onRetry: { [logger] attempt, delay, error in
+                logger.warning("Gemini stream retry model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt + 1, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=0 delay=\(delay, format: .fixed(precision: 2), privacy: .public)s")
+            },
+            onFailure: { [logger] attempt, error in
+                logger.error("Gemini stream request failed model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=0")
+            },
+            operation: { attempt in
+                var request = URLRequest(
+                    url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse")!
+                )
+                request.httpMethod = "POST"
+                request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = 120
+                request.httpBody = bodyData
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw CloudTTSError.invalidResponse
-        }
-        if !(200..<300).contains(http.statusCode) {
-            var errorData = Data()
-            for try await byte in bytes {
-                errorData.append(byte)
+                self.logger.notice("Gemini stream request model=\(model, privacy: .public) chunk=\(chunkIndex + 1, privacy: .public)/\(chunkCount, privacy: .public) attempt=\(attempt, privacy: .public)")
+                let result = try await URLSession.shared.bytes(for: request)
+                guard let http = result.1 as? HTTPURLResponse else {
+                    throw CloudTTSError.invalidResponse
+                }
+                if !(200..<300).contains(http.statusCode) {
+                    var errorData = Data()
+                    for try await byte in result.0 {
+                        errorData.append(byte)
+                    }
+                    let body = String(data: errorData, encoding: .utf8)
+                    throw CloudTTSError.httpError(http.statusCode, body)
+                }
+                return result
             }
-            let body = String(data: errorData, encoding: .utf8)
-            throw CloudTTSError.httpError(http.statusCode, body)
-        }
+        )
         logger.notice("[LATENCY] Gemini response-headers duration=\(Date().timeIntervalSince(requestStart), format: .fixed(precision: 3), privacy: .public)s")
 
         try Task.checkCancellation()
