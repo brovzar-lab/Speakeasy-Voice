@@ -2,6 +2,30 @@ import Foundation
 import SwiftData
 import os
 
+struct EnhancementExecutionPolicy: Equatable {
+    let timeoutOverride: TimeInterval?
+    let retryOnTimeoutOverride: Bool?
+    let maxAttemptsOverride: Int?
+    let showUserWarning: Bool
+
+    static func forDictation(isResponseMode: Bool) -> EnhancementExecutionPolicy {
+        if isResponseMode {
+            return EnhancementExecutionPolicy(
+                timeoutOverride: nil,
+                retryOnTimeoutOverride: nil,
+                maxAttemptsOverride: nil,
+                showUserWarning: true
+            )
+        }
+        return EnhancementExecutionPolicy(
+            timeoutOverride: 4,
+            retryOnTimeoutOverride: false,
+            maxAttemptsOverride: 1,
+            showUserWarning: false
+        )
+    }
+}
+
 /// Handles the full post-recording pipeline:
 /// transcribe → filter → format → word-replace → AI enhance → deliver → save
 @MainActor
@@ -64,6 +88,7 @@ class TranscriptionPipeline {
         onDismiss: @escaping () async -> Void,
         assistant: AssistantHooks = .inactive
     ) async {
+        let pipelineStart = Date()
         let model = transcriptionConfiguration.model
         var finalText: String?
         var didInsertSessionMetric = false
@@ -113,6 +138,7 @@ class TranscriptionPipeline {
             }
             text = TranscriptionOutputFilter.filter(text)
             let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
+            logger.notice("[LATENCY] transcription model=\(model.displayName, privacy: .public) duration=\(transcriptionDuration, format: .fixed(precision: 3), privacy: .public)s chars=\(text.count, privacy: .public)")
 
             if shouldCancel() { await finishCanceledTranscription(); return }
 
@@ -158,6 +184,9 @@ class TranscriptionPipeline {
                     } == true
                 outputForDelivery = resolvedOutputConfiguration
                 responseConfig = shouldRespondInRecorder ? resolvedEnhancementConfiguration : nil
+                let enhancementPolicy = EnhancementExecutionPolicy.forDictation(
+                    isResponseMode: shouldRespondInRecorder
+                )
 
                 let isSkipShortEnhancementEnabled = UserDefaults.standard.bool(forKey: "SkipShortEnhancement")
                 let savedThreshold = UserDefaults.standard.integer(forKey: "ShortEnhancementWordThreshold")
@@ -184,7 +213,10 @@ class TranscriptionPipeline {
                         let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(
                             textForAI,
                             configuration: resolvedEnhancementConfiguration,
-                            contextSnapshot: contextSnapshot
+                            contextSnapshot: contextSnapshot,
+                            timeoutOverride: enhancementPolicy.timeoutOverride,
+                            retryOnTimeoutOverride: enhancementPolicy.retryOnTimeoutOverride,
+                            maxAttemptsOverride: enhancementPolicy.maxAttemptsOverride
                         )
                         transcription.enhancedText = enhancedText
                         transcription.aiEnhancementModelName = resolvedEnhancementConfiguration.modelName ?? resolvedEnhancementConfiguration.provider?.defaultModel
@@ -193,16 +225,20 @@ class TranscriptionPipeline {
                         transcription.aiRequestSystemMessage = enhancementService.lastSystemMessageSent
                         transcription.aiRequestUserMessage = enhancementService.lastUserMessageSent
                         finalText = enhancedText
+                        logger.notice("[LATENCY] enhancement duration=\(enhancementDuration, format: .fixed(precision: 3), privacy: .public)s chars=\(enhancedText.count, privacy: .public)")
                     } catch {
                         let errorDescription = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                         transcription.enhancedText = String(format: String(localized: "Enhancement failed: %@"), errorDescription)
-                        responseError = errorDescription
-                        let shortReason = String(errorDescription.prefix(80))
-                        await MainActor.run {
-                            NotificationManager.shared.showNotification(
-                                title: String(format: String(localized: "Enhancement failed: %@"), shortReason),
-                                type: .warning
-                            )
+                        responseError = shouldRespondInRecorder ? errorDescription : nil
+                        logger.warning("Enhancement failed; delivering original transcript: \(errorDescription, privacy: .public)")
+                        if enhancementPolicy.showUserWarning {
+                            let shortReason = String(errorDescription.prefix(80))
+                            await MainActor.run {
+                                NotificationManager.shared.showNotification(
+                                    title: String(format: String(localized: "Enhancement failed: %@"), shortReason),
+                                    type: .warning
+                                )
+                            }
                         }
                         if shouldCancel() { await finishCanceledTranscription(); return }
                     }
@@ -257,6 +293,7 @@ class TranscriptionPipeline {
             return
         }
 
+        let deliveryStart = Date()
         await delivery.deliver(
             TranscriptionDelivery.Request(
                 transcription: transcription,
@@ -274,6 +311,7 @@ class TranscriptionPipeline {
                 failResponse: assistant.failResponse
             )
         )
+        logger.notice("[LATENCY] delivery-post duration=\(Date().timeIntervalSince(deliveryStart), format: .fixed(precision: 3), privacy: .public)s pipeline-total=\(Date().timeIntervalSince(pipelineStart), format: .fixed(precision: 3), privacy: .public)s")
 
         saveTranscriptionAndPostCompletion()
     }

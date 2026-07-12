@@ -1,7 +1,17 @@
 import SwiftUI
 
+enum AppVersionDisplay {
+    static func text(version: String) -> String {
+        "Version \(version)"
+    }
+}
+
 struct AppSidebar: View {
     @Binding var selectedView: ViewType
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.5"
+    }
 
     var body: some View {
         ZStack(alignment: .trailing) {
@@ -32,7 +42,13 @@ struct AppSidebar: View {
             .padding(.bottom, 12)
 
             sidebarSection(ViewType.secondaryItems)
-                .padding(.bottom, 14)
+
+            Text(AppVersionDisplay.text(version: appVersion))
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.top, 5)
+                .padding(.bottom, 10)
+                .accessibilityLabel("Speakeasy-Voice version \(appVersion)")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

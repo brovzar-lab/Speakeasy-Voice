@@ -6,8 +6,11 @@ import OSLog
 /// multiple sentences generate in parallel while the first one is already
 /// playing.
 ///
-/// Chunks target ~250 chars each, always broken on sentence boundaries when
-/// possible. If a "sentence" is longer than the target, we split at the last
+/// Gemini chunks target ~600 chars each, always broken on sentence boundaries
+/// when possible. This stays below the provider's long-audio truncation window
+/// while leaving enough buffered audio to bridge into the next request without
+/// a paragraph-sized pause. If a sentence is longer than the target, split at
+/// the last
 /// space before the limit rather than chop mid-word. Abbreviations like
 /// "Mr." and "e.g." are handled by the regex — we only treat a period as a
 /// terminator when it's followed by whitespace and a capital letter or newline.
@@ -18,10 +21,10 @@ enum SentenceChunker {
 
     /// Target chunk size in characters. Slightly larger than a typical
     /// sentence, so short sentences stay together and long ones split.
-    static let targetChunkChars = 250
+    static let targetChunkChars = 600
 
     /// Never exceed this even if we can't find a good boundary.
-    static let maxChunkChars = 400
+    static let maxChunkChars = 750
 
     /// Returns `nil` if the text is short enough for a single request.
     /// Returns an array of chunk strings otherwise.
@@ -35,13 +38,19 @@ enum SentenceChunker {
             return splitBySize(trimmed)
         }
 
+        // A long opening sentence must be bounded before it enters the merge
+        // buffer; otherwise the early `buffer.isEmpty` path can emit it whole.
+        let boundedSentences = sentences.flatMap { sentence in
+            sentence.count > maxChunkChars ? splitBySize(sentence) : [sentence]
+        }
+
         // Merge small sentences into ~targetChunkChars-sized chunks so we get
         // ~2-4 chunks for a typical paragraph. Too many chunks = too many HTTP
         // requests; too few chunks = time-to-first-audio doesn't improve.
         var chunks: [String] = []
         var buffer = ""
 
-        for sentence in sentences {
+        for sentence in boundedSentences {
             if buffer.isEmpty {
                 buffer = sentence
                 continue

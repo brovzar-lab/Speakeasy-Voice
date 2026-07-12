@@ -36,6 +36,13 @@ final class ReadAloudManager: ObservableObject {
     /// The AppKit indicator reads this directly instead.
     private(set) var progress: Double = 0.0
     @Published private(set) var currentText: String = ""
+    @Published private(set) var queueCount: Int = 0
+    @Published private(set) var activeProvider: ReadAloudProvider?
+
+    var elapsedSeconds: TimeInterval {
+        guard let playbackStartedAt else { return accumulatedPlaybackSeconds }
+        return accumulatedPlaybackSeconds + max(0, Date().timeIntervalSince(playbackStartedAt))
+    }
 
     // MARK: - Dependencies (lazy, so we don't spin up AVFoundation until needed)
 
@@ -75,6 +82,13 @@ final class ReadAloudManager: ObservableObject {
     private var playbackTask: Task<Void, Never>?
     private lazy var indicatorWindow: ReadAloudIndicatorWindow = ReadAloudIndicatorWindow(manager: self)
     private var messagePanel: NSPanel?
+    private var textQueue = ReadAloudTextQueue()
+    private var activeSessionID: UUID?
+    private var playbackStartedAt: Date?
+    private var accumulatedPlaybackSeconds: TimeInterval = 0
+    private var pausedAfterPlaybackStarted = false
+    private var selectionCaptureTasks: [UUID: Task<Void, Never>] = [:]
+    private var playbackTransitionTask: Task<Void, Never>?
 
     private init() {}
 
@@ -83,33 +97,40 @@ final class ReadAloudManager: ObservableObject {
     /// Read whatever text the user has currently selected in the frontmost app.
     /// If no text is selected (or Accessibility is not trusted), shows a notification.
     func readSelectedText() {
-        guard state == .idle else {
-            // If already reading, replace what's playing with the new selection.
-            stop()
-            // Small delay so AVSpeechSynthesizer flushes cleanly before we queue a new utterance.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 60_000_000)
-                self.readSelectedText()
-            }
-            return
-        }
-
         // Capture text BEFORE publishing state or showing UI. Publishing first
         // + Accessibility work has been crashing SwiftData @Query layout in the
         // main window on macOS 26 (MainActor executor check / HIE).
-        Task { @MainActor in
+        let captureID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.selectionCaptureTasks[captureID] = nil }
             let text = await SelectedTextService.fetchSelectedTextForReadAloud()
+            guard !Task.isCancelled else { return }
             // Let the run loop settle after any Accessibility / menu-copy work.
             await Task.yield()
             try? await Task.sleep(nanoseconds: 50_000_000)
+            guard !Task.isCancelled else { return }
 
             guard let text, !text.isEmpty else {
                 self.logger.info("readSelectedText: no selection")
                 self.showReadAloudMessage(String(localized: "No text is selected"))
                 return
             }
+
+            if self.state != .idle {
+                if ReadAloudSettings.shared.enqueueSelectedText {
+                    self.textQueue.enqueue(text)
+                    self.queueCount = self.textQueue.count
+                    self.showReadAloudMessage("Added to reading queue (\(self.queueCount))")
+                    return
+                }
+                self.resetCurrentSession(clearQueue: true, hideIndicator: true)
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                guard !Task.isCancelled else { return }
+            }
             await self.speak(text)
         }
+        selectionCaptureTasks[captureID] = task
     }
 
     /// Present the region selection overlay; OCR the drawn rectangle; then speak the result.
@@ -188,6 +209,11 @@ final class ReadAloudManager: ObservableObject {
 
     func pause() {
         guard state == .speaking else { return }
+        if let playbackStartedAt {
+            accumulatedPlaybackSeconds += max(0, Date().timeIntervalSince(playbackStartedAt))
+            self.playbackStartedAt = nil
+            pausedAfterPlaybackStarted = true
+        }
         currentProviderRef?.pause()
         state = .paused
     }
@@ -196,22 +222,68 @@ final class ReadAloudManager: ObservableObject {
         guard state == .paused else { return }
         currentProviderRef?.resume()
         state = .speaking
+        if pausedAfterPlaybackStarted {
+            playbackStartedAt = Date()
+            pausedAfterPlaybackStarted = false
+        }
     }
 
     func stop() {
+        selectionCaptureTasks.values.forEach { $0.cancel() }
+        selectionCaptureTasks.removeAll()
+        playbackTransitionTask?.cancel()
+        playbackTransitionTask = nil
+        resetCurrentSession(clearQueue: true, hideIndicator: true)
+    }
+
+    func skipToNext() {
+        guard let next = textQueue.dequeue() else {
+            stop()
+            return
+        }
+
+        resetCurrentSession(clearQueue: false, hideIndicator: false)
+        queueCount = textQueue.count
+
+        let transition = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            self.playbackTransitionTask = nil
+            await self.speak(next)
+        }
+        playbackTransitionTask = transition
+    }
+
+    private func resetCurrentSession(clearQueue: Bool, hideIndicator: Bool) {
+        activeSessionID = nil
         playbackTask?.cancel()
         playbackTask = nil
         currentProviderRef?.stop()
         currentProviderRef = nil
-        setProgress(0)
+        activeProvider = nil
+        playbackStartedAt = nil
+        accumulatedPlaybackSeconds = 0
+        pausedAfterPlaybackStarted = false
+        if clearQueue {
+            textQueue.clear()
+            queueCount = 0
+        }
+        resetProgress()
         currentText = ""
         state = .idle
-        indicatorWindow.hide()
+        if hideIndicator { indicatorWindow.hide() }
     }
 
     /// Updates the playback fraction and refreshes only the AppKit indicator.
     private func setProgress(_ value: Double) {
+        if playbackStartedAt == nil, state == .speaking {
+            playbackStartedAt = Date()
+        }
         progress = value
+        indicatorWindow.progressDidChange()
+    }
+
+    private func resetProgress() {
+        progress = 0
         indicatorWindow.progressDidChange()
     }
 
@@ -301,53 +373,102 @@ final class ReadAloudManager: ObservableObject {
 
     private func speak(_ text: String) async {
         let settings = ReadAloudSettings.shared
-        let voice = settings.makeVoiceConfiguration()
+        let primaryKind = settings.provider
+        let sessionID = UUID()
+        activeSessionID = sessionID
 
         currentText = text
         state = .loading
-
-        let provider: TextToSpeechProvider
-        switch settings.provider {
-        case .apple:
-            provider = appleProvider
-        case .elevenlabs:
-            provider = elevenLabsProvider
-        case .openai:
-            provider = openAIProvider
-        case .gemini:
-            provider = geminiProvider
-        }
-
-        currentProviderRef = provider
+        activeProvider = primaryKind
+        let primaryProvider = provider(for: primaryKind)
+        currentProviderRef = primaryProvider
+        playbackStartedAt = nil
+        accumulatedPlaybackSeconds = 0
+        pausedAfterPlaybackStarted = false
 
         // Show the indicator now that we're about to actually speak.
         indicatorWindow.show()
 
         // Kick off playback in a task so the manager stays responsive to stop/pause calls.
         let task = Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
-                self?.state = .speaking
-                try await provider.speak(text, voice: voice)
+                self.state = .speaking
+                _ = try await ReadAloudPlaybackRecovery.run(
+                    primary: primaryKind,
+                    preferredFallback: settings.fallbackProvider,
+                    fallbackEnabled: settings.automaticFallbackEnabled,
+                    configuredProviders: self.configuredProviders(),
+                    onFallback: { fallbackKind in
+                        let fallbackProvider = self.provider(for: fallbackKind)
+                        self.logger.warning("Read-aloud primary failed; continuing with fallback primary=\(primaryKind.rawValue, privacy: .public) fallback=\(fallbackKind.rawValue, privacy: .public)")
+                        self.showReadAloudMessage("\(primaryKind.shortName) is unavailable. Continuing with \(fallbackKind.shortName).")
+                        self.activeProvider = fallbackKind
+                        self.currentProviderRef = fallbackProvider
+                        self.state = .speaking
+                    },
+                    speak: { kind in
+                        let selectedProvider = self.provider(for: kind)
+                        try await selectedProvider.speak(
+                            text,
+                            voice: settings.makeVoiceConfiguration(for: kind)
+                        )
+                    }
+                )
             } catch is CancellationError {
                 // Cancelled by stop() — nothing to log.
             } catch {
-                self?.logger.error("read-aloud playback failed: \(error.localizedDescription, privacy: .public)")
-                self?.showReadAloudMessage(
-                    String(format: String(localized: "Read-aloud failed: %@"), error.localizedDescription)
+                let visibleProvider = self.activeProvider ?? primaryKind
+                self.logger.error("read-aloud playback failed provider=\(visibleProvider.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                self.showReadAloudMessage(
+                    ReadAloudErrorPresentation.message(provider: visibleProvider, error: error)
                 )
             }
 
-            // If we're still the active task (i.e. stop() didn't already fire), reset state.
-            guard let self else { return }
-            if self.currentProviderRef === provider {
-                self.state = .idle
-                self.setProgress(0)
-                self.currentText = ""
-                self.currentProviderRef = nil
-                self.indicatorWindow.hide()
-            }
+            guard self.activeSessionID == sessionID else { return }
+            await self.finishSession()
         }
         playbackTask = task
+    }
+
+    private func finishSession() async {
+        playbackTask = nil
+        currentProviderRef = nil
+        activeProvider = nil
+        playbackStartedAt = nil
+        accumulatedPlaybackSeconds = 0
+        pausedAfterPlaybackStarted = false
+        resetProgress()
+        currentText = ""
+
+        if let next = textQueue.dequeue() {
+            queueCount = textQueue.count
+            state = .idle
+            await speak(next)
+        } else {
+            queueCount = 0
+            activeSessionID = nil
+            state = .idle
+            indicatorWindow.hide()
+        }
+    }
+
+    private func provider(for kind: ReadAloudProvider) -> TextToSpeechProvider {
+        switch kind {
+        case .apple: return appleProvider
+        case .elevenlabs: return elevenLabsProvider
+        case .openai: return openAIProvider
+        case .gemini: return geminiProvider
+        }
+    }
+
+    private func configuredProviders() -> Set<ReadAloudProvider> {
+        var providers = Set<ReadAloudProvider>()
+        if APIKeyManager.shared.hasAPIKey(forProvider: "elevenlabs") { providers.insert(.elevenlabs) }
+        if APIKeyManager.shared.hasAPIKey(forProvider: "openai") { providers.insert(.openai) }
+        if APIKeyManager.shared.hasAPIKey(forProvider: "gemini") { providers.insert(.gemini) }
+        if ReadAloudSettings.shared.fallbackProvider == .apple { providers.insert(.apple) }
+        return providers
     }
 }
 

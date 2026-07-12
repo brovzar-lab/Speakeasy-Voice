@@ -4,7 +4,7 @@ WHISPER_CPP_DIR := $(DEPS_DIR)/whisper.cpp
 FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
 LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
 
-.PHONY: all clean whisper setup build local check healthcheck help dev run signing-cert
+.PHONY: all clean whisper setup build local test check healthcheck help dev run signing-cert
 
 # Default target
 all: check build
@@ -83,6 +83,20 @@ local: check setup signing-cert
 		exit 1; \
 	fi
 
+# Run tests with the same stable local identity used by the installed app.
+# The test host cannot launch reliably when it is ad-hoc or unsigned.
+test: check setup signing-cert
+	xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -configuration Debug \
+		-destination 'platform=macOS' \
+		-xcconfig LocalBuild.xcconfig \
+		CODE_SIGN_IDENTITY="Speakeasy-Voice Local" \
+		CODE_SIGN_STYLE=Manual \
+		CODE_SIGNING_REQUIRED=YES \
+		CODE_SIGNING_ALLOWED=YES \
+		DEVELOPMENT_TEAM="" \
+		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/VoiceInk/VoiceInk.local.entitlements" \
+		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD'
+
 # Run application
 run:
 	@if [ -d "$$HOME/Downloads/Speakeasy-Voice.app" ]; then \
@@ -113,6 +127,7 @@ help:
 	@echo "  whisper            Clone and build whisper.cpp XCFramework"
 	@echo "  setup              Copy whisper XCFramework to VoiceInk project"
 	@echo "  build              Build the VoiceInk Xcode project"
+	@echo "  test               Run the signed unit and UI test suite"
 	@echo "  signing-cert       Create the stable local code-signing identity (once)"
 	@echo "  local              Build for local use (no Apple Developer certificate needed)"
 	@echo "  run                Launch the built VoiceInk app"

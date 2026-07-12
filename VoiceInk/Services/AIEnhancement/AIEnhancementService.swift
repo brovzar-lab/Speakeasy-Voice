@@ -87,11 +87,15 @@ class AIEnhancementService: ObservableObject {
         return APIKeyManager.shared.hasAPIKey(forProvider: provider.rawValue)
     }
 
-    private func waitForRateLimit() async throws {
+    private func waitForRateLimit(deadline: Date? = nil) async throws {
         if let lastRequest = lastRequestTime {
             let timeSinceLastRequest = Date().timeIntervalSince(lastRequest)
             if timeSinceLastRequest < rateLimitInterval {
-                try await Task.sleep(nanoseconds: UInt64((rateLimitInterval - timeSinceLastRequest) * 1_000_000_000))
+                let requiredWait = rateLimitInterval - timeSinceLastRequest
+                if let deadline, Date().addingTimeInterval(requiredWait) >= deadline {
+                    throw EnhancementError.timeout
+                }
+                try await Task.sleep(nanoseconds: UInt64(requiredWait * 1_000_000_000))
             }
         }
         lastRequestTime = Date()
@@ -169,8 +173,18 @@ class AIEnhancementService: ObservableObject {
     private func makeRequest(
         text: String,
         configuration: EnhancementRuntimeConfiguration,
-        contextSnapshot: RecordingContextSnapshot?
+        contextSnapshot: RecordingContextSnapshot?,
+        timeoutOverride: TimeInterval?
     ) async throws -> String {
+        let deadline = timeoutOverride.map { Date().addingTimeInterval($0) }
+
+        func remainingRequestTimeout() throws -> TimeInterval {
+            guard let deadline else { return baseTimeout }
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw EnhancementError.timeout }
+            return remaining
+        }
+
         guard isConfigured(for: configuration) else {
             throw EnhancementError.notConfigured
         }
@@ -183,7 +197,6 @@ class AIEnhancementService: ObservableObject {
             throw EnhancementError.notConfigured
         }
         let modelName = configuration.modelName ?? provider.defaultModel
-
         guard !text.isEmpty else {
             return ""
         }
@@ -202,11 +215,12 @@ class AIEnhancementService: ObservableObject {
 
         if provider == .ollama {
             do {
+                let requestTimeout = try remainingRequestTimeout()
                 let result = try await aiService.enhanceWithOllama(
                     text: formattedText,
                     systemPrompt: systemMessage,
                     model: modelName,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
                 return AIEnhancementOutputFilter.filter(result)
             } catch {
@@ -225,10 +239,17 @@ class AIEnhancementService: ObservableObject {
 
         if provider == .localCLI {
             do {
-                let result = try await aiService.enhanceWithLocalCLI(systemPrompt: systemMessage, userPrompt: formattedText)
+                let result = try await aiService.enhanceWithLocalCLI(
+                    systemPrompt: systemMessage,
+                    userPrompt: formattedText,
+                    timeoutOverride: try remainingRequestTimeout()
+                )
                 return AIEnhancementOutputFilter.filter(result)
             } catch {
                 if let localError = error as? LocalCLIError {
+                    if case .timeout = localError {
+                        throw EnhancementError.timeout
+                    }
                     throw EnhancementError.customError(localError.errorDescription ?? "An unknown Local CLI error occurred.")
                 } else {
                     throw EnhancementError.customError(error.localizedDescription)
@@ -236,7 +257,8 @@ class AIEnhancementService: ObservableObject {
             }
         }
 
-        try await waitForRateLimit()
+        try await waitForRateLimit(deadline: deadline)
+        let requestTimeout = try remainingRequestTimeout()
 
         do {
             let result: String
@@ -247,7 +269,7 @@ class AIEnhancementService: ObservableObject {
                     model: modelName,
                     messages: [.user(formattedText)],
                     systemPrompt: systemMessage,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             case .custom:
                 guard let customConfiguration = CustomAIProviderManager.shared.requestConfiguration(forModel: modelName),
@@ -261,7 +283,7 @@ class AIEnhancementService: ObservableObject {
                     messages: [.user(formattedText)],
                     systemPrompt: systemMessage,
                     temperature: 0.3,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             default:
                 guard let baseURL = URL(string: provider.baseURL) else {
@@ -285,7 +307,7 @@ class AIEnhancementService: ObservableObject {
                     temperature: temperature,
                     reasoningEffort: reasoningEffort,
                     extraBody: extraBody,
-                    timeout: baseTimeout
+                    timeout: requestTimeout
                 )
             }
             return AIEnhancementOutputFilter.filter(result.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -339,7 +361,9 @@ class AIEnhancementService: ObservableObject {
         text: String,
         configuration: EnhancementRuntimeConfiguration,
         contextSnapshot: RecordingContextSnapshot?,
-        maxRetries: Int = 3,
+        timeoutOverride: TimeInterval?,
+        retryOnTimeoutOverride: Bool?,
+        maxRetries: Int = 2,
         initialDelay: TimeInterval = 1.0
     ) async throws -> String {
         var retries = 0
@@ -350,7 +374,8 @@ class AIEnhancementService: ObservableObject {
                 return try await makeRequest(
                     text: text,
                     configuration: configuration,
-                    contextSnapshot: contextSnapshot
+                    contextSnapshot: contextSnapshot,
+                    timeoutOverride: timeoutOverride
                 )
             } catch let error as EnhancementError {
                 switch error {
@@ -365,7 +390,7 @@ class AIEnhancementService: ObservableObject {
                         throw error
                     }
                 case .timeout:
-                    if retryOnTimeout {
+                    if retryOnTimeoutOverride ?? retryOnTimeout {
                         retries += 1
                         if retries < maxRetries {
                             logger.warning("Request timed out, retrying immediately... (Attempt \(retries, privacy: .public)/\(maxRetries, privacy: .public))")
@@ -404,7 +429,10 @@ class AIEnhancementService: ObservableObject {
     func enhance(
         _ text: String,
         configuration: EnhancementRuntimeConfiguration,
-        contextSnapshot: RecordingContextSnapshot? = nil
+        contextSnapshot: RecordingContextSnapshot? = nil,
+        timeoutOverride: TimeInterval? = nil,
+        retryOnTimeoutOverride: Bool? = nil,
+        maxAttemptsOverride: Int? = nil
     ) async throws -> (String, TimeInterval, String?) {
         let startTime = Date()
         let promptName = configuration.prompt?.title
@@ -413,7 +441,10 @@ class AIEnhancementService: ObservableObject {
             let result = try await makeRequestWithRetry(
                 text: text,
                 configuration: configuration,
-                contextSnapshot: contextSnapshot
+                contextSnapshot: contextSnapshot,
+                timeoutOverride: timeoutOverride,
+                retryOnTimeoutOverride: retryOnTimeoutOverride,
+                maxRetries: maxAttemptsOverride ?? 2
             )
             let endTime = Date()
             let duration = endTime.timeIntervalSince(startTime)

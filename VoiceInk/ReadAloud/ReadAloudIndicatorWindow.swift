@@ -30,7 +30,7 @@ final class ReadAloudIndicatorWindow {
     /// Called on high-frequency playback ticks. Updates the AppKit bar only —
     /// never goes through SwiftUI observation.
     func progressDidChange() {
-        contentView?.refreshProgressOnly()
+        contentView?.refreshLiveData()
     }
 
     private func initialize() {
@@ -69,7 +69,7 @@ private final class IndicatorPanel: NSPanel {
     }
 
     static func metrics() -> NSRect {
-        let width: CGFloat = 280
+        let width: CGFloat = 360
         let height: CGFloat = 44
         guard let screen = NSScreen.main else {
             return NSRect(x: 40, y: 40, width: width, height: height)
@@ -99,6 +99,7 @@ private final class ReadAloudIndicatorContentView: NSView {
     private let slowerButton = NSButton()
     private let fasterButton = NSButton()
     private let playPauseButton = NSButton()
+    private let nextButton = NSButton()
     private let stopButton = NSButton()
     private let progressLayer = CALayer()
 
@@ -134,6 +135,7 @@ private final class ReadAloudIndicatorContentView: NSView {
         configureIconButton(slowerButton, symbol: "tortoise.fill", size: 10, action: #selector(slowerTapped))
         configureIconButton(fasterButton, symbol: "hare.fill", size: 10, action: #selector(fasterTapped))
         configureIconButton(playPauseButton, symbol: "pause.fill", size: 11, action: #selector(playPauseTapped))
+        configureIconButton(nextButton, symbol: "forward.end.fill", size: 10, action: #selector(nextTapped))
         configureIconButton(stopButton, symbol: "stop.fill", size: 10, action: #selector(stopTapped))
         stopButton.contentTintColor = .white
         stopButton.wantsLayer = true
@@ -159,7 +161,7 @@ private final class ReadAloudIndicatorContentView: NSView {
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let root = NSStackView(views: [statusImage, statusLabel, spacer, rateStack, playPauseButton, stopButton])
+        let root = NSStackView(views: [statusImage, statusLabel, spacer, rateStack, playPauseButton, nextButton, stopButton])
         root.orientation = .horizontal
         root.spacing = 8
         root.alignment = .centerY
@@ -192,6 +194,8 @@ private final class ReadAloudIndicatorContentView: NSView {
             rateLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
             playPauseButton.widthAnchor.constraint(equalToConstant: 22),
             playPauseButton.heightAnchor.constraint(equalToConstant: 22),
+            nextButton.widthAnchor.constraint(equalToConstant: 22),
+            nextButton.heightAnchor.constraint(equalToConstant: 22),
             stopButton.widthAnchor.constraint(equalToConstant: 22),
             stopButton.heightAnchor.constraint(equalToConstant: 22)
         ])
@@ -199,6 +203,7 @@ private final class ReadAloudIndicatorContentView: NSView {
         toolTip = nil
         slowerButton.toolTip = String(localized: "Slower")
         fasterButton.toolTip = String(localized: "Faster")
+        nextButton.toolTip = String(localized: "Skip to next queued selection")
         stopButton.toolTip = String(localized: "Stop reading")
     }
 
@@ -231,13 +236,18 @@ private final class ReadAloudIndicatorContentView: NSView {
                 DispatchQueue.main.async { self?.refresh() }
             }
             .store(in: &cancellables)
+
+        Timer.publish(every: 1, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.refreshLiveData() }
+            .store(in: &cancellables)
     }
 
     func refresh() {
         guard let manager else { return }
         let settings = ReadAloudSettings.shared
 
-        statusLabel.stringValue = statusText(for: manager.state)
+        statusLabel.stringValue = statusText(for: manager)
         statusImage.image = statusImage(for: manager.state)
         statusImage.contentTintColor = statusTint(for: manager.state)
 
@@ -256,12 +266,16 @@ private final class ReadAloudIndicatorContentView: NSView {
             ? String(localized: "Resume")
             : String(localized: "Pause")
 
-        refreshProgressOnly()
+        nextButton.isEnabled = manager.queueCount > 0
+        nextButton.alphaValue = nextButton.isEnabled ? 1.0 : 0.35
+
+        refreshLiveData()
     }
 
-    /// Updates only the progress fill via CALayer — no Auto Layout mutation.
-    func refreshProgressOnly() {
+    /// Updates lightweight playback data without publishing SwiftUI state.
+    func refreshLiveData() {
         guard let manager else { return }
+        statusLabel.stringValue = statusText(for: manager)
         let totalWidth = effectView.bounds.width
         guard totalWidth > 0 else { return }
         let width = max(2, totalWidth * CGFloat(manager.progress))
@@ -271,14 +285,21 @@ private final class ReadAloudIndicatorContentView: NSView {
         CATransaction.commit()
     }
 
-    private func statusText(for state: ReadAloudState) -> String {
-        switch state {
-        case .idle: return String(localized: "Idle")
-        case .capturing: return String(localized: "Capturing…")
-        case .loading: return String(localized: "Loading…")
-        case .speaking: return String(localized: "Reading")
-        case .paused: return String(localized: "Paused")
+    private func statusText(for manager: ReadAloudManager) -> String {
+        let stateText: String
+        switch manager.state {
+        case .idle: stateText = String(localized: "Idle")
+        case .capturing: stateText = String(localized: "Capturing…")
+        case .loading: stateText = String(localized: "Loading…")
+        case .speaking: stateText = manager.activeProvider?.shortName ?? String(localized: "Reading")
+        case .paused: stateText = String(localized: "Paused")
         }
+
+        guard manager.state == .speaking || manager.state == .paused else { return stateText }
+        let seconds = Int(manager.elapsedSeconds)
+        let elapsed = String(format: "%d:%02d", seconds / 60, seconds % 60)
+        let queue = manager.queueCount > 0 ? "  •  +\(manager.queueCount)" : ""
+        return "\(stateText)  •  \(elapsed)\(queue)"
     }
 
     private func statusImage(for state: ReadAloudState) -> NSImage? {
@@ -304,6 +325,7 @@ private final class ReadAloudIndicatorContentView: NSView {
     @objc private func slowerTapped() { manager?.slower() }
     @objc private func fasterTapped() { manager?.faster() }
     @objc private func playPauseTapped() { manager?.togglePlayback() }
+    @objc private func nextTapped() { manager?.skipToNext() }
     @objc private func stopTapped() { manager?.stop() }
 
     /// Allow clicks without first activating the panel (nonactivatingPanel).
