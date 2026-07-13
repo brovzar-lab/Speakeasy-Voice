@@ -97,5 +97,11 @@ No `.env` — config is UserDefaults + Keychain, set at runtime in the app UI. O
 ## Git
 - Remote: `brovzar-lab/Speakeasy-Voice`. This is the owner's personal fork; committing to `main` and pushing is fine. Do not force-push.
 
+## Execute backlog workflow
+- When Billy says “execute backlog,” read `BACKLOG.md` and show a numbered list of pending entries.
+- Ask which numbered entry he wants implemented. Never execute the entire backlog automatically.
+- Implement only the selected entry, test it, and show proof that it works.
+- Move the entry from Pending to Completed only after that proof succeeds. Preserve its backlog UUID and add the completion date.
+
 ## Reference
 - Original research and roadmap: `~/whisperflow-local-clone-plan.md`

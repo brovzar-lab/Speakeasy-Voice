@@ -11,6 +11,63 @@ import Testing
 
 struct VoiceInkTests {
 
+    @Test func backlogDocumentRoundTripsPendingCompletedAndMultilineEntries() throws {
+        let pending = BacklogEntry(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            text: "Make the button red.\nKeep contrast accessible.",
+            createdAt: Date(timeIntervalSince1970: 1),
+            completedAt: nil
+        )
+        let completed = BacklogEntry(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            text: "Show version 1.5",
+            createdAt: Date(timeIntervalSince1970: 2),
+            completedAt: Date(timeIntervalSince1970: 3)
+        )
+
+        let source = BacklogDocument(entries: [pending, completed]).render()
+        let parsed = try BacklogDocument.parse(source)
+
+        #expect(parsed.entries == [pending, completed])
+    }
+
+    @Test func backlogDefaultPathUsesProvidedHomeDirectory() {
+        let home = URL(fileURLWithPath: "/Users/example", isDirectory: true)
+
+        let url = BacklogFileLocator.defaultURL(homeDirectory: home)
+
+        #expect(url.path == "/Users/example/CODE/SPEAKEASY-VOICE/BACKLOG.md")
+    }
+
+    @Test func backlogSubmissionTrimsTextAndRejectsEmptyDrafts() {
+        #expect(FeatureBacklogSubmission.normalized("   ") == nil)
+        #expect(FeatureBacklogSubmission.normalized("  Make it red. \n") == "Make it red.")
+    }
+
+    @Test @MainActor func backlogStoreReloadsExternalChangesBeforeAdding() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = directory.appendingPathComponent("BACKLOG.md")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = BacklogStore(fileURL: url)
+        await store.load()
+
+        let external = BacklogEntry(
+            id: UUID(),
+            text: "Added in Terminal",
+            createdAt: Date(timeIntervalSince1970: 10),
+            completedAt: nil
+        )
+        try Data(BacklogDocument(entries: [external]).render().utf8).write(to: url, options: .atomic)
+
+        try await store.add(text: "Added in the app")
+        let saved = try BacklogDocument.parse(String(contentsOf: url, encoding: .utf8))
+
+        #expect(saved.entries.map(\.text) == ["Added in Terminal", "Added in the app"])
+    }
+
     @Test func geminiSSEDecoderExtractsAudioFromCamelCasePayload() throws {
         let pcm = Data([0x01, 0x02, 0x03, 0x04])
         let line = Data("data: {\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"data\":\"AQIDBA==\"}}]}}]}".utf8)
