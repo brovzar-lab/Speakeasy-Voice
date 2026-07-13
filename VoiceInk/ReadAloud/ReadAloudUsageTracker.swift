@@ -4,7 +4,7 @@ import OSLog
 
 /// A single billable read-aloud event.
 ///
-/// One record is written when a cloud request completes successfully (HTTP 2xx).
+/// One record is written per read session and aggregates its successful cloud requests.
 /// Apple provider reads are also recorded but with zero cost — useful for the
 /// "reads per day" and "most used voice" stats without polluting spend numbers.
 struct ReadAloudUsageRecord: Codable, Identifiable, Hashable {
@@ -20,6 +20,39 @@ struct ReadAloudUsageRecord: Codable, Identifiable, Hashable {
     /// Estimated cost in USD at time of the request. Cached so historical rows
     /// stay stable even if the pricing table below is later updated.
     let estimatedCostUSD: Double
+}
+
+/// Combines successful rolling requests into one usage row for the user's
+/// selection. It also flushes partial billable work after stop or failure.
+@MainActor
+final class ReadAloudUsageAccumulator {
+    let provider: String
+    let model: String
+    let voiceId: String
+    private(set) var characterCount = 0
+    private var didFlush = false
+
+    init(provider: String, model: String, voiceId: String) {
+        self.provider = provider
+        self.model = model
+        self.voiceId = voiceId
+    }
+
+    func addSuccessfulRequest(characterCount: Int) {
+        guard characterCount > 0 else { return }
+        self.characterCount += characterCount
+    }
+
+    func flush(to tracker: ReadAloudUsageTracker = .shared) {
+        guard !didFlush, characterCount > 0 else { return }
+        didFlush = true
+        tracker.record(
+            provider: provider,
+            model: model,
+            voiceId: voiceId,
+            characterCount: characterCount
+        )
+    }
 }
 
 /// Central bookkeeping for Read Aloud usage: what got read, by whom, and how

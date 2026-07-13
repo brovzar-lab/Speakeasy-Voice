@@ -2,122 +2,31 @@ import Foundation
 import AVFoundation
 import OSLog
 
-/// Splits text into sentence-sized pieces so cloud TTS can be pipelined:
-/// multiple sentences generate in parallel while the first one is already
-/// playing.
-///
-/// Gemini chunks target ~600 chars each, always broken on sentence boundaries
-/// when possible. This stays below the provider's long-audio truncation window
-/// while leaving enough buffered audio to bridge into the next request without
-/// a paragraph-sized pause. If a sentence is longer than the target, split at
-/// the last
-/// space before the limit rather than chop mid-word. Abbreviations like
-/// "Mr." and "e.g." are handled by the regex — we only treat a period as a
-/// terminator when it's followed by whitespace and a capital letter or newline.
+/// Compatibility wrapper retained for older tests and call sites. New cloud
+/// playback uses `ReadAloudSegmentPlanner` directly.
 enum SentenceChunker {
     /// Below this length we don't chunk at all — the overhead (multiple HTTP
     /// requests, delegate wiring) outweighs the latency benefit.
-    static let singleRequestThreshold = 200
+    static let singleRequestThreshold = ReadAloudSegmentPlanner.singleRequestThreshold
 
     /// Target chunk size in characters. Slightly larger than a typical
     /// sentence, so short sentences stay together and long ones split.
-    static let targetChunkChars = 600
+    static let targetChunkChars = ReadAloudSegmentPlanner.targetCharacters
 
     /// Never exceed this even if we can't find a good boundary.
-    static let maxChunkChars = 750
+    static let maxChunkChars = ReadAloudSegmentPlanner.maximumCharacters
 
     /// Returns `nil` if the text is short enough for a single request.
     /// Returns an array of chunk strings otherwise.
     static func chunkIfNeeded(_ text: String) -> [String]? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > singleRequestThreshold else { return nil }
-
-        let sentences = splitSentences(trimmed)
-        guard sentences.count > 1 else {
-            // One sentence but longer than the threshold — split by size only.
-            return splitBySize(trimmed)
-        }
-
-        // A long opening sentence must be bounded before it enters the merge
-        // buffer; otherwise the early `buffer.isEmpty` path can emit it whole.
-        let boundedSentences = sentences.flatMap { sentence in
-            sentence.count > maxChunkChars ? splitBySize(sentence) : [sentence]
-        }
-
-        // Merge small sentences into ~targetChunkChars-sized chunks so we get
-        // ~2-4 chunks for a typical paragraph. Too many chunks = too many HTTP
-        // requests; too few chunks = time-to-first-audio doesn't improve.
-        var chunks: [String] = []
-        var buffer = ""
-
-        for sentence in boundedSentences {
-            if buffer.isEmpty {
-                buffer = sentence
-                continue
-            }
-            let joined = buffer + " " + sentence
-            if joined.count <= targetChunkChars {
-                buffer = joined
-            } else {
-                chunks.append(buffer)
-                buffer = sentence
-            }
-            if buffer.count >= maxChunkChars {
-                chunks.append(buffer)
-                buffer = ""
-            }
-        }
-        if !buffer.isEmpty {
-            chunks.append(buffer)
+        let chunks = ReadAloudSegmentPlanner.plan(text: trimmed).segments.map {
+            $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return chunks.count > 1 ? chunks : nil
     }
 
-    /// Split on `. ` / `? ` / `! ` / newlines while trying to avoid abbreviations.
-    /// Conservative: prefers false negatives (leaving two sentences joined) over
-    /// false positives (splitting mid-abbreviation) — TTS handles a long chunk
-    /// fine, but splitting "Dr. Smith" into "Dr" and "Smith" sounds broken.
-    private static func splitSentences(_ text: String) -> [String] {
-        // (?<=[.?!])          — after a sentence terminator
-        // (?<!\b[A-Z][a-z]?\.)  — but NOT after common abbreviations like "Mr." "Dr." "St."
-        // \s+                 — followed by whitespace
-        // (?=[A-Z"“(\[])      — before a capital letter, quote, or opening bracket
-        let pattern = #"(?<=[.?!])\s+(?=[A-Z"“(\[])"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return text.components(separatedBy: .newlines).filter { !$0.isEmpty }
-        }
-        let range = NSRange(text.startIndex..., in: text)
-        var lastEnd = text.startIndex
-        var result: [String] = []
-        regex.enumerateMatches(in: text, options: [], range: range) { match, _, _ in
-            guard let match, let r = Range(match.range, in: text) else { return }
-            let piece = String(text[lastEnd..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
-            if !piece.isEmpty { result.append(piece) }
-            lastEnd = r.upperBound
-        }
-        let tail = String(text[lastEnd...]).trimmingCharacters(in: .whitespaces)
-        if !tail.isEmpty { result.append(tail) }
-        return result.isEmpty ? [text] : result
-    }
-
-    private static func splitBySize(_ text: String) -> [String] {
-        var result: [String] = []
-        var remaining = text[...]
-        while remaining.count > maxChunkChars {
-            let cutoff = remaining.index(remaining.startIndex, offsetBy: maxChunkChars)
-            // Try to break at the last space before the cutoff.
-            let searchRange = remaining.startIndex..<cutoff
-            if let space = remaining.range(of: " ", options: .backwards, range: searchRange) {
-                result.append(String(remaining[remaining.startIndex..<space.lowerBound]))
-                remaining = remaining[space.upperBound...]
-            } else {
-                result.append(String(remaining[remaining.startIndex..<cutoff]))
-                remaining = remaining[cutoff...]
-            }
-        }
-        if !remaining.isEmpty { result.append(String(remaining)) }
-        return result
-    }
 }
 
 /// Plays a series of mp3 chunks (from parallel HTTP requests) as a single
@@ -137,6 +46,7 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
     /// One slot per expected chunk. Slots start `nil` and get filled in as the
     /// HTTP responses complete (which happens out of order).
     private var slots: [Data?] = []
+    private var failedChunks: Set<Int> = []
     private var totalChunks: Int = 0
     private var nextChunkToPlay: Int = 0
     private var currentPlayer: AVAudioPlayer?
@@ -150,6 +60,10 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
     private var chunksFinished: Int = 0
 
     var onProgress: ((Double) -> Void)?
+    var onChunkFinished: ((Int) -> Void)?
+    var onChunkFailed: ((Int) -> Void)?
+    var onBufferingChanged: ((Bool) -> Void)?
+    private var isBuffering = false
 
     var isPlaying: Bool {
         currentPlayer?.isPlaying ?? false
@@ -160,19 +74,27 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
 
     /// Begin a playback session. `totalChunks` reserves the queue slots so
     /// out-of-order arrivals can drop into the right position.
-    func start(totalChunks: Int, volume: Float, initialRate: Float) async {
+    func start(
+        totalChunks: Int,
+        volume: Float,
+        initialRate: Float,
+        onReady: @MainActor () -> Void = {}
+    ) async {
         stop()
         self.totalChunks = totalChunks
         self.volume = volume
         self.rate = initialRate
         self.slots = Array(repeating: nil, count: totalChunks)
+        self.failedChunks.removeAll()
         self.nextChunkToPlay = 0
         self.chunksFinished = 0
         self.isStopped = false
         self.isPaused = false
+        self.isBuffering = false
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             self.continuation = cont
+            onReady()
             // We only resolve when either the last chunk finishes or stop() is called.
         }
     }
@@ -191,6 +113,13 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
     func skipChunk(at index: Int) {
         guard !isStopped, index >= 0, index < slots.count else { return }
         // Use empty data as a "played" marker to unblock the queue.
+        slots[index] = Data()
+        startPlayingIfReady()
+    }
+
+    func failChunk(at index: Int) {
+        guard !isStopped, index >= 0, index < slots.count else { return }
+        failedChunks.insert(index)
         slots[index] = Data()
         startPlayingIfReady()
     }
@@ -214,9 +143,11 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
 
     func stop() {
         isStopped = true
+        setBuffering(false)
         currentPlayer?.stop()
         currentPlayer = nil
         slots.removeAll()
+        failedChunks.removeAll()
         totalChunks = 0
         nextChunkToPlay = 0
         resolveContinuation()
@@ -233,12 +164,22 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
 
     private func playNextIfAvailable() {
         while nextChunkToPlay < totalChunks {
-            guard let data = slots[nextChunkToPlay] else { return }
+            guard let data = slots[nextChunkToPlay] else {
+                setBuffering(nextChunkToPlay > 0)
+                return
+            }
             let index = nextChunkToPlay
             nextChunkToPlay += 1
 
             if data.isEmpty {
+                if failedChunks.contains(index) {
+                    setBuffering(false)
+                    onChunkFailed?(index)
+                    resolveContinuation()
+                    return
+                }
                 // Chunk was marked skipped due to a failure — advance and try next.
+                onChunkFinished?(index)
                 continue
             }
 
@@ -250,13 +191,15 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
                 player.rate = max(0.5, min(2.0, rate))
                 player.prepareToPlay()
                 currentPlayer = player
-                player.play()
+                if !isPaused { player.play() }
+                setBuffering(false)
                 logger.debug("Playing chunk \(index)/\(self.totalChunks - 1)")
                 return
             } catch {
                 logger.warning("Failed to decode chunk \(index): \(error.localizedDescription, privacy: .public)")
-                // Fall through to next iteration to try the following chunk.
-                continue
+                onChunkFailed?(index)
+                resolveContinuation()
+                return
             }
         }
 
@@ -271,6 +214,8 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
         Task { @MainActor in
             self.currentPlayer = nil
             self.chunksFinished += 1
+            let finishedIndex = self.nextChunkToPlay - 1
+            self.onChunkFinished?(finishedIndex)
             if self.totalChunks > 0 {
                 self.onProgress?(min(1.0, Double(self.chunksFinished) / Double(self.totalChunks)))
             }
@@ -283,5 +228,11 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
     private func resolveContinuation() {
         continuation?.resume()
         continuation = nil
+    }
+
+    private func setBuffering(_ value: Bool) {
+        guard isBuffering != value else { return }
+        isBuffering = value
+        onBufferingChanged?(value)
     }
 }

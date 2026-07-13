@@ -3,7 +3,7 @@ import AVFoundation
 import OSLog
 
 /// Errors surfaced by the cloud TTS providers so the manager can show useful messages.
-enum CloudTTSError: LocalizedError {
+enum CloudTTSError: LocalizedError, Equatable {
     case missingAPIKey(String)
     case invalidResponse
     case httpError(Int, String?)
@@ -290,6 +290,23 @@ private final class PCMStreamTaskHandle: @unchecked Sendable {
     }
 }
 
+private final class PCMStreamErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedError: CloudTTSError?
+
+    func store(_ error: CloudTTSError) {
+        lock.lock()
+        if storedError == nil { storedError = error }
+        lock.unlock()
+    }
+
+    var error: CloudTTSError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedError
+    }
+}
+
 private final class PCMStreamPrefetchSlot: @unchecked Sendable {
     private let lock = NSLock()
     private var taskCancel: (@Sendable () -> Void)?
@@ -326,7 +343,7 @@ private final class PCMStreamPrefetchSlot: @unchecked Sendable {
 private final class PCMStreamLifecycle: @unchecked Sendable {
     private let lock = NSLock()
     private var current: PCMStreamSegment?
-    private var prefetched: PCMStreamPrefetchSlot?
+    private var prefetched: [PCMStreamPrefetchSlot] = []
 
     func setCurrent(_ segment: PCMStreamSegment?) {
         lock.lock()
@@ -334,9 +351,9 @@ private final class PCMStreamLifecycle: @unchecked Sendable {
         lock.unlock()
     }
 
-    func setPrefetched(_ slot: PCMStreamPrefetchSlot?) {
+    func setPrefetched(_ slots: [PCMStreamPrefetchSlot]) {
         lock.lock()
-        prefetched = slot
+        prefetched = slots
         lock.unlock()
     }
 
@@ -346,12 +363,12 @@ private final class PCMStreamLifecycle: @unchecked Sendable {
         let prefetched = prefetched
         lock.unlock()
         current?.cancel()
-        prefetched?.cancel()
+        prefetched.forEach { $0.cancel() }
     }
 }
 
 /// Joins multiple PCM-producing requests into one ordered stream. It keeps one
-/// bounded text segment ahead so provider setup cannot create an audible gap,
+/// bounded text segments ahead so provider setup cannot create an audible gap,
 /// while explicit cancellation handles stop both current and prefetched work.
 enum PCMStreamConcatenator {
     @MainActor
@@ -366,6 +383,8 @@ enum PCMStreamConcatenator {
         count: Int,
         segmentAt: @escaping @MainActor (Int) async throws -> PCMStreamSegment,
         onChunk: @escaping @MainActor (Data) -> Void = { _ in },
+        onSegmentChunk: @escaping @MainActor (Int, Data) -> Void = { _, _ in },
+        onSegmentError: @escaping @MainActor (Int, Error) -> Void = { _, _ in },
         onError: @escaping @MainActor (Error) -> Void = { _ in }
     ) -> AsyncStream<Data> {
         let lifecycle = PCMStreamLifecycle()
@@ -382,15 +401,25 @@ enum PCMStreamConcatenator {
                         return segment
                     }
                     slot.installTask { task.cancel() }
-                    lifecycle.setPrefetched(slot)
                     return (slot, task)
                 }
 
-                var pending = count > 0 ? prefetch(0) : nil
+                var pending: [Int: (slot: PCMStreamPrefetchSlot, task: Task<PCMStreamSegment, Error>)] = [:]
+                let initialEnd = min(count, RollingPrefetchWindow.maximumFutureSegments + 1)
+                if initialEnd > 0 {
+                    for index in 0..<initialEnd {
+                        pending[index] = prefetch(index)
+                    }
+                }
+                lifecycle.setPrefetched(pending.values.map(\.slot))
+
+                var activeIndex = 0
                 do {
                     for index in 0..<count {
+                        activeIndex = index
                         try Task.checkCancellation()
-                        guard let currentPending = pending else { break }
+                        guard let currentPending = pending.removeValue(forKey: index) else { break }
+                        lifecycle.setPrefetched(pending.values.map(\.slot))
                         let segment = try await withTaskCancellationHandler {
                             try await currentPending.task.value
                         } onCancel: {
@@ -398,25 +427,27 @@ enum PCMStreamConcatenator {
                         }
 
                         lifecycle.setCurrent(segment)
-                        if index + 1 < count {
-                            pending = prefetch(index + 1)
-                        } else {
-                            pending = nil
-                            lifecycle.setPrefetched(nil)
-                        }
 
                         for await chunk in segment.stream {
                             try Task.checkCancellation()
                             if !chunk.isEmpty {
                                 onChunk(chunk)
+                                onSegmentChunk(index, chunk)
                                 continuation.yield(chunk)
                             }
                         }
                         try segment.validate()
                         segment.cancel()
                         lifecycle.setCurrent(nil)
+
+                        let nextToPrefetch = index + RollingPrefetchWindow.maximumFutureSegments + 1
+                        if nextToPrefetch < count {
+                            pending[nextToPrefetch] = prefetch(nextToPrefetch)
+                            lifecycle.setPrefetched(pending.values.map(\.slot))
+                        }
                     }
                 } catch {
+                    onSegmentError(activeIndex, error)
                     onError(error)
                 }
                 lifecycle.cancelAll()
@@ -446,6 +477,8 @@ enum PCMContinuousPlaybackCoordinator {
         count: Int,
         segmentAt: @escaping @MainActor (Int) async throws -> PCMStreamSegment,
         onChunk: @escaping @MainActor (Data) -> Void,
+        onSegmentChunk: @escaping @MainActor (Int, Data) -> Void = { _, _ in },
+        onSegmentError: @escaping @MainActor (Int, Error) -> Void = { _, _ in },
         onError: @escaping @MainActor (Error) -> Void,
         playback: @escaping @MainActor (AsyncStream<Data>) async -> Void
     ) async {
@@ -453,6 +486,8 @@ enum PCMContinuousPlaybackCoordinator {
             count: count,
             segmentAt: segmentAt,
             onChunk: onChunk,
+            onSegmentChunk: onSegmentChunk,
+            onSegmentError: onSegmentError,
             onError: onError
         )
         await playback(stream)
@@ -485,6 +520,8 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     /// Guards against double-resume of the playback continuation (crashes otherwise).
     private var didResolveContinuation = false
     var onProgress: ((Double) -> Void)?
+    var onBufferingChanged: ((Bool) -> Void)?
+    private var isBuffering = false
 
     var isPlaying: Bool {
         if let player, player.isPlaying { return true }
@@ -567,6 +604,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                 guard let self else { return }
                 var pending = Data()
                 var didStartPlayback = false
+                let steadyBufferBytes = max(bytesPerFrame, startupThreshold / 2)
 
                 do {
                     for await chunk in stream {
@@ -574,16 +612,13 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         guard !chunk.isEmpty else { continue }
                         pending.append(chunk)
 
-                        let alignedCount = pending.count - (pending.count % bytesPerFrame)
-                        guard alignedCount > 0 else { continue }
-
-                        let shouldFlush = !didStartPlayback
-                            ? alignedCount >= startupThreshold
-                            : alignedCount >= startupThreshold / 2
-
-                        if shouldFlush {
-                            let toPlay = Data(pending.prefix(alignedCount))
-                            pending.removeFirst(alignedCount)
+                        while true {
+                            let alignedCount = pending.count - (pending.count % bytesPerFrame)
+                            let requiredBytes = didStartPlayback ? steadyBufferBytes : startupThreshold
+                            guard alignedCount >= requiredBytes else { break }
+                            try await self.waitForStreamingCapacity()
+                            let toPlay = Data(pending.prefix(requiredBytes))
+                            pending.removeFirst(requiredBytes)
                             if !didStartPlayback {
                                 didStartPlayback = true
                                 self.onProgress?(0)
@@ -592,11 +627,20 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         }
                     }
 
-                    if !pending.isEmpty {
+                    while !pending.isEmpty {
                         let alignedCount = pending.count - (pending.count % bytesPerFrame)
                         if alignedCount > 0 {
-                            let toPlay = Data(pending.prefix(alignedCount))
+                            try await self.waitForStreamingCapacity()
+                            let flushCount = min(alignedCount, steadyBufferBytes)
+                            let toPlay = Data(pending.prefix(flushCount))
+                            pending.removeFirst(flushCount)
+                            if !didStartPlayback {
+                                didStartPlayback = true
+                                self.onProgress?(0)
+                            }
                             self.scheduleStreamingPCMBuffer(toPlay)
+                        } else {
+                            break
                         }
                     }
 
@@ -697,6 +741,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         pendingStreamingBuffers = 0
         streamEnded = false
         currentPCMRate = 1.0
+        setBuffering(false)
         player?.stop()
         player = nil
         resolveContinuation()
@@ -770,6 +815,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             memcpy(destination, source, data.count)
         }
 
+        if pendingStreamingBuffers == 0 { setBuffering(false) }
         pendingStreamingBuffers += 1
         streamingVarispeed?.rate = currentPCMRate
         node.scheduleBuffer(buffer) { [weak self] in
@@ -778,8 +824,20 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                 self.pendingStreamingBuffers = max(0, self.pendingStreamingBuffers - 1)
                 if self.streamEnded, self.pendingStreamingBuffers == 0 {
                     self.finishStreamingPlayback()
+                } else if !self.streamEnded, self.pendingStreamingBuffers == 0 {
+                    self.setBuffering(true)
                 }
             }
+        }
+    }
+
+    private func waitForStreamingCapacity() async throws {
+        // About 1.5 seconds of scheduled audio. This applies backpressure to
+        // the rolling network pipeline instead of letting a long selection
+        // render and queue in memory all at once.
+        while pendingStreamingBuffers >= 12 {
+            try Task.checkCancellation()
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -814,6 +872,12 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         continuation?.resume()
         continuation = nil
     }
+
+    private func setBuffering(_ value: Bool) {
+        guard isBuffering != value else { return }
+        isBuffering = value
+        onBufferingChanged?(value)
+    }
 }
 
 // MARK: - ElevenLabs
@@ -826,14 +890,24 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
 final class ElevenLabsTTSProvider: TextToSpeechProvider {
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "ReadAloud.ElevenLabs")
     private let audioPlayer = CloudTTSPlayer()
+    private let chunkedPlayer = CloudTTSChunkedPlayer()
+    private var activeMP3Session: RollingMP3Session?
 
     var onProgressUpdate: ((Double) -> Void)? {
-        get { audioPlayer.onProgress }
-        set { audioPlayer.onProgress = newValue }
+        didSet {
+            audioPlayer.onProgress = onProgressUpdate
+            chunkedPlayer.onProgress = onProgressUpdate
+        }
+    }
+    var onBufferingUpdate: ((Bool) -> Void)? {
+        didSet {
+            audioPlayer.onBufferingChanged = onBufferingUpdate
+            chunkedPlayer.onBufferingChanged = onBufferingUpdate
+        }
     }
 
-    var isSpeaking: Bool { audioPlayer.isPlaying }
-    var isPaused: Bool { audioPlayer.isPaused }
+    var isSpeaking: Bool { audioPlayer.isPlaying || chunkedPlayer.isPlaying }
+    var isPaused: Bool { audioPlayer.isPaused || chunkedPlayer.isCurrentlyPaused }
 
     func speak(_ text: String, voice: VoiceConfiguration) async throws {
         stop()
@@ -848,49 +922,117 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
 
         let voiceId = voice.voiceIdentifier ?? "21m00Tcm4TlvDq8ikWAM"
         let modelId = ReadAloudSettings.shared.elevenLabsModelId
+        let segments = ReadAloudSegmentPlanner.plan(text: trimmed).segments
+        let bodyDatas = try segments.map {
+            try Self.makeBodyData(text: $0.text, modelId: modelId)
+        }
+        let usage = ReadAloudUsageAccumulator(provider: "elevenlabs", model: modelId, voiceId: voiceId)
+        defer { usage.flush() }
 
-        let body: [String: Any] = [
-            "text": trimmed,
+        do {
+            try await speakWithStreaming(
+                voiceId: voiceId,
+                bodyDatas: bodyDatas,
+                characterCounts: segments.map { $0.text.count },
+                apiKey: apiKey,
+                usage: usage,
+                voice: voice
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let partial as RollingTTSFailure where partial.firstSafeFallbackIndex > 0 {
+            // Some streaming audio was already heard. Replaying via batch would
+            // duplicate speech, so let the manager continue from the safe section.
+            throw partial
+        } catch {
+            logger.warning("ElevenLabs streaming failed, falling back to batch mp3: \(error.localizedDescription, privacy: .public)")
+            try await speakWithBatchMP3(
+                voiceId: voiceId,
+                bodyDatas: bodyDatas,
+                characterCounts: segments.map { $0.text.count },
+                apiKey: apiKey,
+                usage: usage,
+                voice: voice
+            )
+        }
+        try Task.checkCancellation()
+    }
+
+    private static func makeBodyData(text: String, modelId: String) throws -> Data {
+        try JSONSerialization.data(withJSONObject: [
+            "text": text,
             "model_id": modelId,
             "voice_settings": [
                 "stability": 0.5,
                 "similarity_boost": 0.75
             ]
-        ]
-        let bodyData = try JSONSerialization.data(withJSONObject: body)
-
-        do {
-            try await speakWithStreaming(
-                voiceId: voiceId,
-                modelId: modelId,
-                bodyData: bodyData,
-                apiKey: apiKey,
-                trimmed: trimmed,
-                voice: voice
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            logger.warning("ElevenLabs streaming failed, falling back to batch mp3: \(error.localizedDescription, privacy: .public)")
-            try await speakWithBatchMP3(
-                voiceId: voiceId,
-                modelId: modelId,
-                bodyData: bodyData,
-                apiKey: apiKey,
-                trimmed: trimmed,
-                voice: voice
-            )
-        }
+        ])
     }
 
     private func speakWithStreaming(
         voiceId: String,
-        modelId: String,
-        bodyData: Data,
+        bodyDatas: [Data],
+        characterCounts: [Int],
         apiKey: String,
-        trimmed: String,
+        usage: ReadAloudUsageAccumulator,
         voice: VoiceConfiguration
     ) async throws {
+        var pipelineError: Error?
+        var receivedBytes = 0
+        var startedSegments = Set<Int>()
+        var failedSegmentIndex: Int?
+
+        await PCMContinuousPlaybackCoordinator.play(
+            count: bodyDatas.count,
+            segmentAt: { [weak self] index in
+                guard let self else { throw CancellationError() }
+                return try await self.elevenLabsStreamingSegment(
+                    voiceId: voiceId,
+                    bodyData: bodyDatas[index],
+                    apiKey: apiKey,
+                    characterCount: characterCounts[index],
+                    usage: usage
+                )
+            },
+            onChunk: { data in receivedBytes += data.count },
+            onSegmentChunk: { index, _ in startedSegments.insert(index) },
+            onSegmentError: { index, _ in failedSegmentIndex = index },
+            onError: { error in pipelineError = error },
+            playback: { [weak self] stream in
+                guard let self else { return }
+                await self.audioPlayer.playStreamingPCM(
+                    from: stream,
+                    sampleRate: 16_000,
+                    volume: voice.volume,
+                    initialRate: voice.rate
+                )
+            }
+        )
+        try Task.checkCancellation()
+        if let pipelineError {
+            let cloudError = Self.normalizedCloudError(pipelineError)
+            if let failedSegmentIndex {
+                let safeIndex = startedSegments.contains(failedSegmentIndex)
+                    ? failedSegmentIndex + 1
+                    : failedSegmentIndex
+                throw RollingTTSFailure(
+                    firstSafeFallbackIndex: safeIndex,
+                    underlying: cloudError
+                )
+            }
+            if receivedBytes > 0 { throw CloudTTSError.streamEndedEarly }
+            throw cloudError
+        }
+        guard receivedBytes > 0 else { throw CloudTTSError.emptyAudioStream }
+    }
+
+    private func elevenLabsStreamingSegment(
+        voiceId: String,
+        bodyData: Data,
+        apiKey: String,
+        characterCount: Int,
+        usage: ReadAloudUsageAccumulator
+    ) async throws -> PCMStreamSegment {
         var components = URLComponents(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)/stream")!
         components.queryItems = [
             URLQueryItem(name: "output_format", value: "pcm_16000"),
@@ -919,25 +1061,31 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
         }
 
         try Task.checkCancellation()
-        ReadAloudUsageTracker.shared.record(
-            provider: "elevenlabs",
-            model: modelId,
-            voiceId: voiceId,
-            characterCount: trimmed.count
-        )
-
-        let pcmStream = Self.chunkAsyncBytes(bytes, chunkSize: 8_192)
-        await audioPlayer.playStreamingPCM(
-            from: pcmStream,
-            sampleRate: 16_000,
-            volume: voice.volume,
-            initialRate: voice.rate
+        usage.addSuccessfulRequest(characterCount: characterCount)
+        let errors = PCMStreamErrorBox()
+        let stream = Self.chunkAsyncBytes(bytes, chunkSize: 8_192) { error in
+            if let urlError = error as? URLError {
+                if urlError.code != .cancelled { errors.store(.httpError(503, nil)) }
+            } else if !(error is CancellationError) {
+                errors.store(.invalidResponse)
+            }
+        }
+        return PCMStreamSegment(
+            stream: stream,
+            cancel: {},
+            validate: {
+                if let error = errors.error { throw error }
+            }
         )
     }
 
     /// Fold `URLSession.AsyncBytes` into ~8KB `Data` chunks so playback never
     /// hops to MainActor once per byte.
-    private static func chunkAsyncBytes(_ bytes: URLSession.AsyncBytes, chunkSize: Int) -> AsyncStream<Data> {
+    private static func chunkAsyncBytes(
+        _ bytes: URLSession.AsyncBytes,
+        chunkSize: Int,
+        onError: @escaping @Sendable (Error) -> Void = { _ in }
+    ) -> AsyncStream<Data> {
         AsyncStream { continuation in
             let task = Task {
                 var buffer = Data()
@@ -956,7 +1104,10 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
                         continuation.yield(buffer)
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
+                    onError(error)
                     continuation.finish()
                 }
             }
@@ -966,37 +1117,54 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
 
     private func speakWithBatchMP3(
         voiceId: String,
-        modelId: String,
-        bodyData: Data,
+        bodyDatas: [Data],
+        characterCounts: [Int],
         apiKey: String,
-        trimmed: String,
+        usage: ReadAloudUsageAccumulator,
         voice: VoiceConfiguration
     ) async throws {
-        var request = URLRequest(url: URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)")!)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 60
-        request.httpBody = bodyData
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try Self.checkHTTPStatus(response: response, data: data)
-
-        try Task.checkCancellation()
-        ReadAloudUsageTracker.shared.record(
-            provider: "elevenlabs",
-            model: modelId,
-            voiceId: voiceId,
-            characterCount: trimmed.count
+        let session = RollingMP3Session(
+            count: bodyDatas.count,
+            player: chunkedPlayer,
+            volume: voice.volume,
+            rate: voice.rate,
+            prepare: { index in
+                var request = URLRequest(url: URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)")!)
+                request.httpMethod = "POST"
+                request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
+                request.timeoutInterval = 60
+                request.httpBody = bodyDatas[index]
+                let (data, response) = try await URLSession.shared.data(for: request)
+                try Self.checkHTTPStatus(response: response, data: data)
+                usage.addSuccessfulRequest(characterCount: characterCounts[index])
+                return data
+            }
         )
-        await audioPlayer.play(data: data, volume: voice.volume, initialRate: voice.rate)
+        activeMP3Session = session
+        defer { activeMP3Session = nil }
+        try await session.run()
     }
 
-    func pause() { audioPlayer.pause() }
-    func resume() { audioPlayer.resume() }
-    func stop() { audioPlayer.stop() }
-    func setLiveRate(_ rate: Float) { audioPlayer.setRate(rate) }
+    func pause() {
+        audioPlayer.pause()
+        chunkedPlayer.pause()
+    }
+    func resume() {
+        audioPlayer.resume()
+        chunkedPlayer.resume()
+    }
+    func stop() {
+        activeMP3Session?.cancel()
+        activeMP3Session = nil
+        audioPlayer.stop()
+        chunkedPlayer.stop()
+    }
+    func setLiveRate(_ rate: Float) {
+        audioPlayer.setRate(rate)
+        chunkedPlayer.setRate(rate)
+    }
 
     private static func checkHTTPStatus(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
@@ -1006,6 +1174,12 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
             let body = String(data: data, encoding: .utf8)
             throw CloudTTSError.httpError(http.statusCode, body)
         }
+    }
+
+    private static func normalizedCloudError(_ error: Error) -> CloudTTSError {
+        if let cloudError = error as? CloudTTSError { return cloudError }
+        if error is URLError { return .httpError(503, nil) }
+        return .invalidResponse
     }
 }
 
@@ -1018,15 +1192,18 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
 @MainActor
 final class OpenAITTSProvider: TextToSpeechProvider {
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "ReadAloud.OpenAI")
-    private let audioPlayer = CloudTTSPlayer()
+    private let chunkedPlayer = CloudTTSChunkedPlayer()
+    private var activeSession: RollingMP3Session?
 
     var onProgressUpdate: ((Double) -> Void)? {
-        get { audioPlayer.onProgress }
-        set { audioPlayer.onProgress = newValue }
+        didSet { chunkedPlayer.onProgress = onProgressUpdate }
+    }
+    var onBufferingUpdate: ((Bool) -> Void)? {
+        didSet { chunkedPlayer.onBufferingChanged = onBufferingUpdate }
     }
 
-    var isSpeaking: Bool { audioPlayer.isPlaying }
-    var isPaused: Bool { audioPlayer.isPaused }
+    var isSpeaking: Bool { chunkedPlayer.isPlaying }
+    var isPaused: Bool { chunkedPlayer.isCurrentlyPaused }
 
     func speak(_ text: String, voice: VoiceConfiguration) async throws {
         stop()
@@ -1041,41 +1218,49 @@ final class OpenAITTSProvider: TextToSpeechProvider {
 
         let model = ReadAloudSettings.shared.openAIModel
         let voiceName = voice.voiceIdentifier ?? "nova"
+        let segments = ReadAloudSegmentPlanner.plan(text: trimmed).segments
+        let usage = ReadAloudUsageAccumulator(provider: "openai", model: model, voiceId: voiceName)
+        defer { usage.flush() }
 
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/speech")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
-
-        let body: [String: Any] = [
-            "model": model,
-            "input": trimmed,
-            "voice": voiceName,
-            "response_format": "mp3",
-            "speed": max(0.25, min(4.0, Double(voice.rate)))
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try Self.checkHTTPStatus(response: response, data: data)
+        let session = RollingMP3Session(
+            count: segments.count,
+            player: chunkedPlayer,
+            volume: voice.volume,
+            rate: 1.0,
+            prepare: { index in
+                var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/speech")!)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = 60
+                request.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "model": model,
+                    "input": segments[index].text,
+                    "voice": voiceName,
+                    "response_format": "mp3",
+                    "speed": max(0.25, min(4.0, Double(voice.rate)))
+                ])
+                let (data, response) = try await URLSession.shared.data(for: request)
+                try Self.checkHTTPStatus(response: response, data: data)
+                usage.addSuccessfulRequest(characterCount: segments[index].text.count)
+                return data
+            }
+        )
+        activeSession = session
+        defer { activeSession = nil }
+        try await session.run()
 
         try Task.checkCancellation()
-        ReadAloudUsageTracker.shared.record(
-            provider: "openai",
-            model: model,
-            voiceId: voiceName,
-            characterCount: trimmed.count
-        )
-        // OpenAI honors `speed` at generation time, so we can start at 1.0×
-        // and layer any further live adjustment on top via player rate.
-        await audioPlayer.play(data: data, volume: voice.volume, initialRate: 1.0)
     }
 
-    func pause() { audioPlayer.pause() }
-    func resume() { audioPlayer.resume() }
-    func stop() { audioPlayer.stop() }
-    func setLiveRate(_ rate: Float) { audioPlayer.setRate(rate) }
+    func pause() { chunkedPlayer.pause() }
+    func resume() { chunkedPlayer.resume() }
+    func stop() {
+        activeSession?.cancel()
+        activeSession = nil
+        chunkedPlayer.stop()
+    }
+    func setLiveRate(_ rate: Float) { chunkedPlayer.setRate(rate) }
 
     private static func checkHTTPStatus(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
@@ -1105,6 +1290,9 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         get { audioPlayer.onProgress }
         set { audioPlayer.onProgress = newValue }
     }
+    var onBufferingUpdate: ((Bool) -> Void)? {
+        didSet { audioPlayer.onBufferingChanged = onBufferingUpdate }
+    }
 
     var isSpeaking: Bool { audioPlayer.isPlaying }
     var isPaused: Bool { audioPlayer.isPaused }
@@ -1123,13 +1311,9 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         let model = ReadAloudSettings.shared.geminiModel
         let voiceName = voice.voiceIdentifier ?? "Kore"
         let settings = ReadAloudSettings.shared
-        let chunks: [String]
-        if trimmed.count > SentenceChunker.maxChunkChars,
-           let split = SentenceChunker.chunkIfNeeded(trimmed) {
-            chunks = split
-        } else {
-            chunks = [trimmed]
-        }
+        let chunks = ReadAloudSegmentPlanner.plan(text: trimmed).segments.map(\.text)
+        let usage = ReadAloudUsageAccumulator(provider: "gemini", model: model, voiceId: voiceName)
+        defer { usage.flush() }
 
         var batchRetryDelays = CloudTTSRetryPolicy.retryDelays
         if settings.geminiSupportsStreaming {
@@ -1138,14 +1322,10 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                 try await speakWithStreaming(
                     model: model,
                     bodyDatas: bodies,
+                    characterCounts: chunks.map(\.count),
                     apiKey: apiKey,
+                    usage: usage,
                     voice: voice
-                )
-                ReadAloudUsageTracker.shared.record(
-                    provider: "gemini",
-                    model: model,
-                    voiceId: voiceName,
-                    characterCount: trimmed.count
                 )
                 return
             } catch is CancellationError {
@@ -1168,16 +1348,11 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         try await speakWithBatch(
             model: model,
             bodyDatas: bodies,
+            characterCounts: chunks.map(\.count),
             apiKey: apiKey,
+            usage: usage,
             voice: voice,
             retryDelays: batchRetryDelays
-        )
-
-        ReadAloudUsageTracker.shared.record(
-            provider: "gemini",
-            model: model,
-            voiceId: voiceName,
-            characterCount: trimmed.count
         )
     }
 
@@ -1208,32 +1383,73 @@ final class GeminiTTSProvider: TextToSpeechProvider {
     private func speakWithBatch(
         model: String,
         bodyDatas: [Data],
+        characterCounts: [Int],
         apiKey: String,
+        usage: ReadAloudUsageAccumulator,
         voice: VoiceConfiguration,
         retryDelays: [TimeInterval]
     ) async throws {
-        var combinedPCM = Data()
+        var pipelineError: Error?
+        var receivedBytes = 0
+        var startedSegments = Set<Int>()
+        var failedSegmentIndex: Int?
 
-        for (index, bodyData) in bodyDatas.enumerated() {
-            try Task.checkCancellation()
-            combinedPCM.append(try await batchPCM(
-                model: model,
-                bodyData: bodyData,
-                apiKey: apiKey,
-                chunkIndex: index,
-                chunkCount: bodyDatas.count,
-                retryDelays: retryDelays
-            ))
-        }
-
-        guard !combinedPCM.isEmpty else { throw CloudTTSError.emptyAudioStream }
-        await audioPlayer.play(
-            pcmData: combinedPCM,
-            sampleRate: Self.pcmSampleRate,
-            volume: voice.volume,
-            initialRate: voice.rate
+        await PCMContinuousPlaybackCoordinator.play(
+            count: bodyDatas.count,
+            segmentAt: { [weak self] index in
+                guard let self else { throw CancellationError() }
+                let pcm = try await self.batchPCM(
+                    model: model,
+                    bodyData: bodyDatas[index],
+                    apiKey: apiKey,
+                    chunkIndex: index,
+                    chunkCount: bodyDatas.count,
+                    retryDelays: retryDelays
+                )
+                usage.addSuccessfulRequest(characterCount: characterCounts[index])
+                return PCMStreamSegment.wrapping(AsyncStream { continuation in
+                    if !pcm.isEmpty { continuation.yield(pcm) }
+                    continuation.finish()
+                })
+            },
+            onChunk: { pcm in
+                receivedBytes += pcm.count
+            },
+            onSegmentChunk: { index, _ in
+                startedSegments.insert(index)
+            },
+            onSegmentError: { index, _ in
+                failedSegmentIndex = index
+            },
+            onError: { error in
+                pipelineError = error
+            },
+            playback: { [weak self] stream in
+                guard let self else { return }
+                await self.audioPlayer.playStreamingPCM(
+                    from: stream,
+                    sampleRate: Self.pcmSampleRate,
+                    volume: voice.volume,
+                    initialRate: voice.rate
+                )
+            }
         )
         try Task.checkCancellation()
+        if let pipelineError {
+            let cloudError = (pipelineError as? CloudTTSError) ?? .invalidResponse
+            if let failedSegmentIndex {
+                let safeIndex = startedSegments.contains(failedSegmentIndex)
+                    ? failedSegmentIndex + 1
+                    : failedSegmentIndex
+                throw RollingTTSFailure(
+                    firstSafeFallbackIndex: safeIndex,
+                    underlying: cloudError
+                )
+            }
+            if receivedBytes > 0 { throw CloudTTSError.streamEndedEarly }
+            throw cloudError
+        }
+        guard receivedBytes > 0 else { throw CloudTTSError.emptyAudioStream }
     }
 
     private func batchPCM(
@@ -1271,11 +1487,15 @@ final class GeminiTTSProvider: TextToSpeechProvider {
     private func speakWithStreaming(
         model: String,
         bodyDatas: [Data],
+        characterCounts: [Int],
         apiKey: String,
+        usage: ReadAloudUsageAccumulator,
         voice: VoiceConfiguration
     ) async throws {
         let playbackStart = Date()
         let aggregateMonitor = GeminiStreamMonitor(startedAt: playbackStart)
+        var startedSegments = Set<Int>()
+        var failedSegmentIndex: Int?
 
         await PCMContinuousPlaybackCoordinator.play(
             count: bodyDatas.count,
@@ -1292,7 +1512,9 @@ final class GeminiTTSProvider: TextToSpeechProvider {
                     bodyData: bodyDatas[index],
                     apiKey: apiKey,
                     chunkIndex: index,
-                    chunkCount: bodyDatas.count
+                    chunkCount: bodyDatas.count,
+                    characterCount: characterCounts[index],
+                    usage: usage
                 )
 
                 return PCMStreamSegment(
@@ -1316,6 +1538,12 @@ final class GeminiTTSProvider: TextToSpeechProvider {
             },
             onChunk: { pcm in
                 aggregateMonitor.record(bytes: pcm.count)
+            },
+            onSegmentChunk: { index, _ in
+                startedSegments.insert(index)
+            },
+            onSegmentError: { index, _ in
+                failedSegmentIndex = index
             },
             onError: { error in
                 aggregateMonitor.fail(GeminiStreamFailurePolicy.resolve(
@@ -1341,6 +1569,15 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         }
         if let error = result.error {
             logger.error("Gemini stream failed model=\(model, privacy: .public) status=\(error.httpStatusCode ?? -1, privacy: .public) bytesPlayed=\(result.bytes, privacy: .public)")
+            if let failedSegmentIndex {
+                let safeIndex = startedSegments.contains(failedSegmentIndex)
+                    ? failedSegmentIndex + 1
+                    : failedSegmentIndex
+                throw RollingTTSFailure(
+                    firstSafeFallbackIndex: safeIndex,
+                    underlying: error
+                )
+            }
             throw error
         }
         guard result.bytes > 0 else { throw CloudTTSError.emptyAudioStream }
@@ -1351,7 +1588,9 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         bodyData: Data,
         apiKey: String,
         chunkIndex: Int,
-        chunkCount: Int
+        chunkCount: Int,
+        characterCount: Int,
+        usage: ReadAloudUsageAccumulator
     ) async throws -> (PCMStreamSegment, GeminiStreamMonitor) {
         let requestStart = Date()
         let (bytes, _) = try await CloudTTSRetryPolicy.run(
@@ -1391,6 +1630,7 @@ final class GeminiTTSProvider: TextToSpeechProvider {
         logger.notice("[LATENCY] Gemini response-headers duration=\(Date().timeIntervalSince(requestStart), format: .fixed(precision: 3), privacy: .public)s")
 
         try Task.checkCancellation()
+        usage.addSuccessfulRequest(characterCount: characterCount)
         return Self.decodeGeminiSSEToPCMChunks(bytes, startedAt: requestStart)
     }
 

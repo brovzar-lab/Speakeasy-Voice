@@ -292,10 +292,11 @@ private final class ReadAloudIndicatorContentView: NSView {
         case .capturing: stateText = String(localized: "Capturing…")
         case .loading: stateText = String(localized: "Loading…")
         case .speaking: stateText = manager.activeProvider?.shortName ?? String(localized: "Reading")
+        case .buffering: stateText = String(localized: "Buffering next section")
         case .paused: stateText = String(localized: "Paused")
         }
 
-        guard manager.state == .speaking || manager.state == .paused else { return stateText }
+        guard manager.state == .speaking || manager.state == .buffering || manager.state == .paused else { return stateText }
         let seconds = Int(manager.elapsedSeconds)
         let elapsed = String(format: "%d:%02d", seconds / 60, seconds % 60)
         let queue = manager.queueCount > 0 ? "  •  +\(manager.queueCount)" : ""
@@ -308,6 +309,7 @@ private final class ReadAloudIndicatorContentView: NSView {
         case .idle: name = "speaker.slash"
         case .capturing, .loading: name = "ellipsis.circle"
         case .speaking: name = "speaker.wave.2.fill"
+        case .buffering: name = "ellipsis"
         case .paused: name = "pause.circle.fill"
         }
         let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
@@ -317,6 +319,7 @@ private final class ReadAloudIndicatorContentView: NSView {
     private func statusTint(for state: ReadAloudState) -> NSColor {
         switch state {
         case .speaking: return .controlAccentColor
+        case .buffering: return .systemYellow
         case .paused: return .systemOrange
         default: return .secondaryLabelColor
         }

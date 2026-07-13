@@ -81,6 +81,66 @@ enum ReadAloudPlaybackRecovery {
             return fallback
         }
     }
+
+    static func runSegmentAware(
+        primary: ReadAloudProvider,
+        preferredFallback: ReadAloudProvider,
+        fallbackEnabled: Bool,
+        configuredProviders: Set<ReadAloudProvider>,
+        segmentCount: Int,
+        onFallback: (ReadAloudProvider) -> Void,
+        speak: (ReadAloudProvider, Int) async throws -> Void
+    ) async throws -> ReadAloudProvider {
+        do {
+            try await speak(primary, 0)
+            return primary
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let partial as RollingTTSFailure {
+            guard partial.firstSafeFallbackIndex < segmentCount,
+                  let fallback = partialFallback(
+                      primary: primary,
+                      preferred: preferredFallback,
+                      isEnabled: fallbackEnabled,
+                      configuredProviders: configuredProviders,
+                      error: partial.underlying
+                  ) else {
+                throw partial.underlying
+            }
+            try Task.checkCancellation()
+            onFallback(fallback)
+            try await speak(fallback, partial.firstSafeFallbackIndex)
+            return fallback
+        } catch let error as CloudTTSError {
+            guard let fallback = ReadAloudFallbackPolicy.resolve(
+                primary: primary,
+                preferred: preferredFallback,
+                isEnabled: fallbackEnabled,
+                configuredProviders: configuredProviders,
+                error: error
+            ) else {
+                throw error
+            }
+            try Task.checkCancellation()
+            onFallback(fallback)
+            try await speak(fallback, 0)
+            return fallback
+        }
+    }
+
+    private static func partialFallback(
+        primary: ReadAloudProvider,
+        preferred: ReadAloudProvider,
+        isEnabled: Bool,
+        configuredProviders: Set<ReadAloudProvider>,
+        error: CloudTTSError
+    ) -> ReadAloudProvider? {
+        guard isEnabled, error.isTransient || error == .streamEndedEarly else { return nil }
+        var seen = Set<ReadAloudProvider>()
+        return [preferred, .elevenlabs, .openai]
+            .filter { seen.insert($0).inserted }
+            .first { $0 != primary && configuredProviders.contains($0) }
+    }
 }
 
 enum ReadAloudErrorPresentation {

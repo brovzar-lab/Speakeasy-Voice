@@ -52,6 +52,8 @@ protocol TextToSpeechProvider: AnyObject {
     var isPaused: Bool { get }
     /// Fires with a coarse 0.0–1.0 progress estimate as speech advances.
     var onProgressUpdate: ((Double) -> Void)? { get set }
+    /// Fires when playback drains its prepared audio while the next section loads.
+    var onBufferingUpdate: ((Bool) -> Void)? { get set }
 }
 
 // MARK: - Apple (local) provider
@@ -84,6 +86,7 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
     private var isRestarting = false
 
     var onProgressUpdate: ((Double) -> Void)?
+    var onBufferingUpdate: ((Bool) -> Void)?
 
     var isSpeaking: Bool { synthesizer.isSpeaking && !synthesizer.isPaused }
     var isPaused: Bool { synthesizer.isPaused }

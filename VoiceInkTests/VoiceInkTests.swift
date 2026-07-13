@@ -68,6 +68,29 @@ struct VoiceInkTests {
         #expect(saved.entries.map(\.text) == ["Added in Terminal", "Added in the app"])
     }
 
+    @Test @MainActor func backlogStoreEditsCompletesAndDeletesAnItem() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = directory.appendingPathComponent("BACKLOG.md")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = BacklogStore(fileURL: url)
+        await store.load()
+        try await store.add(text: "Make it red")
+        let id = try #require(store.entries.first?.id)
+
+        try await store.edit(id: id, text: "Make it dark")
+        #expect(store.entries.first?.text == "Make it dark")
+
+        try await store.complete(id: id)
+        #expect(store.entries.first?.isCompleted == true)
+
+        try await store.delete(id: id)
+        let saved = try BacklogDocument.parse(String(contentsOf: url, encoding: .utf8))
+        #expect(saved.entries.isEmpty)
+    }
+
     @Test func geminiSSEDecoderExtractsAudioFromCamelCasePayload() throws {
         let pcm = Data([0x01, 0x02, 0x03, 0x04])
         let line = Data("data: {\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"data\":\"AQIDBA==\"}}]}}]}".utf8)
@@ -143,6 +166,76 @@ struct VoiceInkTests {
         #expect(chunks.allSatisfy { $0.count <= SentenceChunker.maxChunkChars })
     }
 
+    @Test func segmentPlannerPrefersParagraphsAndPreservesContent() {
+        let first = String(repeating: "First paragraph sentence. ", count: 18)
+        let second = String(repeating: "Second paragraph sentence. ", count: 18)
+        let text = first + "\n\n" + second
+
+        let plan = ReadAloudSegmentPlanner.plan(text: text)
+
+        #expect(plan.segments.count > 1)
+        #expect(plan.segments.allSatisfy { !$0.text.isEmpty && $0.text.count <= 750 })
+        #expect(plan.reconstructedText == text.trimmingCharacters(in: .whitespacesAndNewlines))
+        #expect(plan.segments[0].text.hasSuffix("\n\n"))
+    }
+
+    @Test func segmentPlannerHardCapsUnbrokenText() {
+        let plan = ReadAloudSegmentPlanner.plan(text: String(repeating: "a", count: 1_900))
+
+        #expect(plan.segments.count == 3)
+        #expect(plan.segments.allSatisfy { $0.text.count <= ReadAloudSegmentPlanner.maximumCharacters })
+        #expect(plan.reconstructedText.count == 1_900)
+    }
+
+    @Test func rollingRecoveryNeverReplaysStartedSegment() {
+        let position = RollingRecoveryPosition(
+            completedThrough: 1,
+            activeIndex: 2,
+            activeAudioStarted: true
+        )
+
+        #expect(position.firstSafeFallbackIndex == 3)
+    }
+
+    @Test func rollingRecoveryRetriesUnheardActiveSegment() {
+        let position = RollingRecoveryPosition(
+            completedThrough: 1,
+            activeIndex: 2,
+            activeAudioStarted: false
+        )
+
+        #expect(position.firstSafeFallbackIndex == 2)
+    }
+
+    @Test func rollingWindowNeverExceedsTwoFutureSegments() {
+        #expect(RollingPrefetchWindow.maximumFutureSegments == 2)
+        #expect(RollingPrefetchWindow.indices(current: 2, total: 8) == [3, 4])
+        #expect(RollingPrefetchWindow.indices(current: 6, total: 8) == [7])
+    }
+
+    @Test func orderedSegmentBufferWaitsForZeroWhenOneFinishesFirst() {
+        var buffer = OrderedSegmentBuffer<Data>(count: 3)
+        buffer.insert(Data([1]), at: 1)
+        #expect(buffer.popNext() == nil)
+        buffer.insert(Data([0]), at: 0)
+        #expect(buffer.popNext() == Data([0]))
+        #expect(buffer.popNext() == Data([1]))
+    }
+
+    @Test func bufferingRemainsAnActiveReadAloudState() {
+        #expect(ReadAloudState.buffering.isActive)
+        #expect(!ReadAloudState.idle.isActive)
+    }
+
+    @Test func fallbackTextBeginsAtTheFirstSafeSegment() throws {
+        let plan = ReadAloudSegmentPlanner.plan(
+            text: String(repeating: "A complete sentence. ", count: 100)
+        )
+        let second = try #require(plan.segments.indices.contains(1) ? plan.segments[1] : nil)
+
+        #expect(plan.text(fromSegment: 1).hasPrefix(second.text))
+    }
+
     @Test @MainActor func streamingStartupBarrierCompletesWhenStartupFinishes() async throws {
         var pendingChecks = 0
         let ready = try await StreamingStartupBarrier.waitUntilReady(
@@ -212,6 +305,28 @@ struct VoiceInkTests {
 
         #expect(playbackSessions == 1)
         #expect(received == [Data([0x01, 0x02]), Data([0x03, 0x04])])
+    }
+
+    @Test @MainActor func pcmPipelineInitiallyPreparesOnlyCurrentAndTwoFutureSegments() async {
+        var requested: [Int] = []
+        let stream = PCMStreamConcatenator.concatenate(count: 6) { index in
+            requested.append(index)
+            return PCMStreamSegment.wrapping(AsyncStream { continuation in
+                Task {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    continuation.yield(Data([UInt8(index)]))
+                    continuation.finish()
+                }
+            })
+        }
+
+        let consumer = Task { @MainActor in
+            for await _ in stream { }
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+
+        #expect(Set(requested) == Set([0, 1, 2]))
+        consumer.cancel()
     }
 
     @Test func geminiFailureAfterAudioNeverReplaysFromBatch() {
@@ -483,6 +598,47 @@ struct VoiceInkTests {
         _ = try? await task.value
 
         #expect(fallbackCalls == 0)
+    }
+
+    @Test func partialRecoveryContinuesFallbackAfterHeardSegments() async throws {
+        var providers: [ReadAloudProvider] = []
+        var startingSegments: [Int] = []
+
+        let finalProvider = try await ReadAloudPlaybackRecovery.runSegmentAware(
+            primary: .gemini,
+            preferredFallback: .elevenlabs,
+            fallbackEnabled: true,
+            configuredProviders: [.elevenlabs],
+            segmentCount: 4,
+            onFallback: { _ in },
+            speak: { provider, startingSegment in
+                providers.append(provider)
+                startingSegments.append(startingSegment)
+                if provider == .gemini {
+                    throw RollingTTSFailure(
+                        firstSafeFallbackIndex: 2,
+                        underlying: .streamEndedEarly
+                    )
+                }
+            }
+        )
+
+        #expect(finalProvider == .elevenlabs)
+        #expect(providers == [.gemini, .elevenlabs])
+        #expect(startingSegments == [0, 2])
+    }
+
+    @Test @MainActor func usageAccumulatorCombinesSuccessfulRollingRequests() {
+        let accumulator = ReadAloudUsageAccumulator(
+            provider: "openai",
+            model: "tts-1",
+            voiceId: "nova"
+        )
+
+        accumulator.addSuccessfulRequest(characterCount: 500)
+        accumulator.addSuccessfulRequest(characterCount: 250)
+
+        #expect(accumulator.characterCount == 750)
     }
 
     @Test func geminiStreamingAndBatchFallbackShareThreeRequestBudget() {

@@ -9,7 +9,10 @@ enum ReadAloudState: Equatable {
     case capturing         // grabbing selected text / OCR-ing screen region
     case loading           // provider is preparing audio (network for cloud)
     case speaking
+    case buffering        // waiting for the next rolling cloud section
     case paused
+
+    var isActive: Bool { self != .idle }
 }
 
 /// Central orchestrator for the Read Aloud feature.
@@ -51,6 +54,9 @@ final class ReadAloudManager: ObservableObject {
         p.onProgressUpdate = { [weak self] value in
             Task { @MainActor in self?.setProgress(value) }
         }
+        p.onBufferingUpdate = { [weak self] value in
+            Task { @MainActor in self?.setBuffering(value) }
+        }
         return p
     }()
 
@@ -58,6 +64,9 @@ final class ReadAloudManager: ObservableObject {
         let p = ElevenLabsTTSProvider()
         p.onProgressUpdate = { [weak self] value in
             Task { @MainActor in self?.setProgress(value) }
+        }
+        p.onBufferingUpdate = { [weak self] value in
+            Task { @MainActor in self?.setBuffering(value) }
         }
         return p
     }()
@@ -67,6 +76,9 @@ final class ReadAloudManager: ObservableObject {
         p.onProgressUpdate = { [weak self] value in
             Task { @MainActor in self?.setProgress(value) }
         }
+        p.onBufferingUpdate = { [weak self] value in
+            Task { @MainActor in self?.setBuffering(value) }
+        }
         return p
     }()
 
@@ -74,6 +86,9 @@ final class ReadAloudManager: ObservableObject {
         let p = GeminiTTSProvider()
         p.onProgressUpdate = { [weak self] value in
             Task { @MainActor in self?.setProgress(value) }
+        }
+        p.onBufferingUpdate = { [weak self] value in
+            Task { @MainActor in self?.setBuffering(value) }
         }
         return p
     }()
@@ -200,7 +215,7 @@ final class ReadAloudManager: ObservableObject {
             return
         case .loading:
             stop()
-        case .speaking:
+        case .speaking, .buffering:
             pause()
         case .paused:
             resume()
@@ -208,7 +223,7 @@ final class ReadAloudManager: ObservableObject {
     }
 
     func pause() {
-        guard state == .speaking else { return }
+        guard state == .speaking || state == .buffering else { return }
         if let playbackStartedAt {
             accumulatedPlaybackSeconds += max(0, Date().timeIntervalSince(playbackStartedAt))
             self.playbackStartedAt = nil
@@ -285,6 +300,11 @@ final class ReadAloudManager: ObservableObject {
     private func resetProgress() {
         progress = 0
         indicatorWindow.progressDidChange()
+    }
+
+    private func setBuffering(_ isBuffering: Bool) {
+        guard activeSessionID != nil, state != .idle, state != .capturing, state != .paused else { return }
+        state = isBuffering ? .buffering : .speaking
     }
 
     /// AppKit-only toast — never mounts SwiftUI/`NSHostingView` (those re-enter
@@ -373,6 +393,7 @@ final class ReadAloudManager: ObservableObject {
 
     private func speak(_ text: String) async {
         let settings = ReadAloudSettings.shared
+        let segmentPlan = ReadAloudSegmentPlanner.plan(text: text)
         let primaryKind = settings.provider
         let sessionID = UUID()
         activeSessionID = sessionID
@@ -394,11 +415,12 @@ final class ReadAloudManager: ObservableObject {
             guard let self else { return }
             do {
                 self.state = .speaking
-                _ = try await ReadAloudPlaybackRecovery.run(
+                _ = try await ReadAloudPlaybackRecovery.runSegmentAware(
                     primary: primaryKind,
                     preferredFallback: settings.fallbackProvider,
                     fallbackEnabled: settings.automaticFallbackEnabled,
                     configuredProviders: self.configuredProviders(),
+                    segmentCount: segmentPlan.segments.count,
                     onFallback: { fallbackKind in
                         let fallbackProvider = self.provider(for: fallbackKind)
                         self.logger.warning("Read-aloud primary failed; continuing with fallback primary=\(primaryKind.rawValue, privacy: .public) fallback=\(fallbackKind.rawValue, privacy: .public)")
@@ -407,10 +429,10 @@ final class ReadAloudManager: ObservableObject {
                         self.currentProviderRef = fallbackProvider
                         self.state = .speaking
                     },
-                    speak: { kind in
+                    speak: { kind, startingSegment in
                         let selectedProvider = self.provider(for: kind)
                         try await selectedProvider.speak(
-                            text,
+                            segmentPlan.text(fromSegment: startingSegment),
                             voice: settings.makeVoiceConfiguration(for: kind)
                         )
                     }
