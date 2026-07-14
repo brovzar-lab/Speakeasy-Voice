@@ -723,6 +723,17 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         streamingNode?.rate = clamped
     }
 
+    func seek(by seconds: TimeInterval) -> Bool {
+        guard let player, player.duration > 0 else { return false }
+        player.currentTime = PlaybackSeekTarget.seconds(
+            current: player.currentTime,
+            duration: player.duration,
+            delta: seconds
+        )
+        onProgress?(player.currentTime / player.duration)
+        return true
+    }
+
     func stop() {
         progressTimer?.invalidate()
         progressTimer = nil
@@ -1165,6 +1176,9 @@ final class ElevenLabsTTSProvider: TextToSpeechProvider {
         audioPlayer.setRate(rate)
         chunkedPlayer.setRate(rate)
     }
+    func seek(by seconds: TimeInterval) -> Bool {
+        audioPlayer.seek(by: seconds) || chunkedPlayer.seek(by: seconds)
+    }
 
     private static func checkHTTPStatus(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
@@ -1261,6 +1275,7 @@ final class OpenAITTSProvider: TextToSpeechProvider {
         chunkedPlayer.stop()
     }
     func setLiveRate(_ rate: Float) { chunkedPlayer.setRate(rate) }
+    func seek(by seconds: TimeInterval) -> Bool { chunkedPlayer.seek(by: seconds) }
 
     private static func checkHTTPStatus(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
@@ -1360,6 +1375,7 @@ final class GeminiTTSProvider: TextToSpeechProvider {
     func resume() { audioPlayer.resume() }
     func stop() { audioPlayer.stop() }
     func setLiveRate(_ rate: Float) { audioPlayer.setRate(rate) }
+    func seek(by seconds: TimeInterval) -> Bool { audioPlayer.seek(by: seconds) }
 
     private static func makeRequestBody(text: String, voiceName: String) throws -> Data {
         let body: [String: Any] = [

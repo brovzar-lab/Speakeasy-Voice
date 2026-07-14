@@ -54,7 +54,7 @@ struct ReadAloudSettingsView: View {
                         }
                 }
 
-                Toggle("Enqueue Selected Text", isOn: $settings.enqueueSelectedText)
+                Toggle("Queue New Selections", isOn: $settings.enqueueSelectedText)
 
                 Toggle("Automatic Backup Voice", isOn: $settings.automaticFallbackEnabled)
 
@@ -69,7 +69,7 @@ struct ReadAloudSettingsView: View {
             } header: {
                 Text("Playback")
             } footer: {
-                Text("Queued selections play in order. If a cloud provider fails before audio starts, Speakeasy retries and can continue with the backup provider.")
+                Text("By default, selecting new text interrupts the current reading. Turn on Queue New Selections to play selections in order instead. If a cloud provider fails, Speakeasy retries and can continue with the backup provider.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

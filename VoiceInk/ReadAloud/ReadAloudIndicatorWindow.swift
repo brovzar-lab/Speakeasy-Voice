@@ -69,7 +69,7 @@ private final class IndicatorPanel: NSPanel {
     }
 
     static func metrics() -> NSRect {
-        let width: CGFloat = 360
+        let width: CGFloat = 420
         let height: CGFloat = 44
         guard let screen = NSScreen.main else {
             return NSRect(x: 40, y: 40, width: width, height: height)
@@ -98,7 +98,9 @@ private final class ReadAloudIndicatorContentView: NSView {
     private let rateLabel = NSTextField(labelWithString: "1.0×")
     private let slowerButton = NSButton()
     private let fasterButton = NSButton()
+    private let rewindButton = NSButton()
     private let playPauseButton = NSButton()
+    private let forwardButton = NSButton()
     private let nextButton = NSButton()
     private let stopButton = NSButton()
     private let progressLayer = CALayer()
@@ -134,7 +136,9 @@ private final class ReadAloudIndicatorContentView: NSView {
 
         configureIconButton(slowerButton, symbol: "tortoise.fill", size: 10, action: #selector(slowerTapped))
         configureIconButton(fasterButton, symbol: "hare.fill", size: 10, action: #selector(fasterTapped))
+        configureIconButton(rewindButton, symbol: "gobackward.5", size: 11, action: #selector(rewindTapped))
         configureIconButton(playPauseButton, symbol: "pause.fill", size: 11, action: #selector(playPauseTapped))
+        configureIconButton(forwardButton, symbol: "goforward.5", size: 11, action: #selector(forwardTapped))
         configureIconButton(nextButton, symbol: "forward.end.fill", size: 10, action: #selector(nextTapped))
         configureIconButton(stopButton, symbol: "stop.fill", size: 10, action: #selector(stopTapped))
         stopButton.contentTintColor = .white
@@ -161,7 +165,17 @@ private final class ReadAloudIndicatorContentView: NSView {
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let root = NSStackView(views: [statusImage, statusLabel, spacer, rateStack, playPauseButton, nextButton, stopButton])
+        let root = NSStackView(views: [
+            statusImage,
+            statusLabel,
+            spacer,
+            rateStack,
+            rewindButton,
+            playPauseButton,
+            forwardButton,
+            nextButton,
+            stopButton
+        ])
         root.orientation = .horizontal
         root.spacing = 8
         root.alignment = .centerY
@@ -192,8 +206,12 @@ private final class ReadAloudIndicatorContentView: NSView {
             fasterButton.widthAnchor.constraint(equalToConstant: 20),
             fasterButton.heightAnchor.constraint(equalToConstant: 22),
             rateLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            rewindButton.widthAnchor.constraint(equalToConstant: 22),
+            rewindButton.heightAnchor.constraint(equalToConstant: 22),
             playPauseButton.widthAnchor.constraint(equalToConstant: 22),
             playPauseButton.heightAnchor.constraint(equalToConstant: 22),
+            forwardButton.widthAnchor.constraint(equalToConstant: 22),
+            forwardButton.heightAnchor.constraint(equalToConstant: 22),
             nextButton.widthAnchor.constraint(equalToConstant: 22),
             nextButton.heightAnchor.constraint(equalToConstant: 22),
             stopButton.widthAnchor.constraint(equalToConstant: 22),
@@ -203,6 +221,8 @@ private final class ReadAloudIndicatorContentView: NSView {
         toolTip = nil
         slowerButton.toolTip = String(localized: "Slower")
         fasterButton.toolTip = String(localized: "Faster")
+        rewindButton.toolTip = String(localized: "Rewind 5 seconds")
+        forwardButton.toolTip = String(localized: "Forward 5 seconds")
         nextButton.toolTip = String(localized: "Skip to next queued selection")
         stopButton.toolTip = String(localized: "Stop reading")
     }
@@ -266,6 +286,14 @@ private final class ReadAloudIndicatorContentView: NSView {
             ? String(localized: "Resume")
             : String(localized: "Pause")
 
+        let canSeek = manager.state == .speaking
+            || manager.state == .buffering
+            || manager.state == .paused
+        rewindButton.isEnabled = canSeek
+        forwardButton.isEnabled = canSeek
+        rewindButton.alphaValue = canSeek ? 1.0 : 0.35
+        forwardButton.alphaValue = canSeek ? 1.0 : 0.35
+
         nextButton.isEnabled = manager.queueCount > 0
         nextButton.alphaValue = nextButton.isEnabled ? 1.0 : 0.35
 
@@ -327,7 +355,9 @@ private final class ReadAloudIndicatorContentView: NSView {
 
     @objc private func slowerTapped() { manager?.slower() }
     @objc private func fasterTapped() { manager?.faster() }
+    @objc private func rewindTapped() { manager?.rewindFiveSeconds() }
     @objc private func playPauseTapped() { manager?.togglePlayback() }
+    @objc private func forwardTapped() { manager?.forwardFiveSeconds() }
     @objc private func nextTapped() { manager?.skipToNext() }
     @objc private func stopTapped() { manager?.stop() }
 

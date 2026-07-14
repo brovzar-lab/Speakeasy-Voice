@@ -104,6 +104,10 @@ final class ReadAloudManager: ObservableObject {
     private var pausedAfterPlaybackStarted = false
     private var selectionCaptureTasks: [UUID: Task<Void, Never>] = [:]
     private var playbackTransitionTask: Task<Void, Never>?
+    private var playbackSourceText = ""
+    private var activeTextStartOffset = 0
+    private var activeTextCount = 0
+    private var providerProgress = 0.0
 
     private init() {}
 
@@ -112,6 +116,11 @@ final class ReadAloudManager: ObservableObject {
     /// Read whatever text the user has currently selected in the frontmost app.
     /// If no text is selected (or Accessibility is not trusted), shows a notification.
     func readSelectedText() {
+        // If two shortcuts arrive close together, only the newest selection
+        // capture is allowed to start playback.
+        selectionCaptureTasks.values.forEach { $0.cancel() }
+        selectionCaptureTasks.removeAll()
+
         // Capture text BEFORE publishing state or showing UI. Publishing first
         // + Accessibility work has been crashing SwiftData @Query layout in the
         // main window on macOS 26 (MainActor executor check / HIE).
@@ -132,16 +141,21 @@ final class ReadAloudManager: ObservableObject {
                 return
             }
 
-            if self.state != .idle {
-                if ReadAloudSettings.shared.enqueueSelectedText {
-                    self.textQueue.enqueue(text)
-                    self.queueCount = self.textQueue.count
-                    self.showReadAloudMessage("Added to reading queue (\(self.queueCount))")
-                    return
-                }
+            switch ReadAloudSelectionPolicy.action(
+                isReading: self.state != .idle,
+                enqueueSelectedText: ReadAloudSettings.shared.enqueueSelectedText
+            ) {
+            case .enqueue:
+                self.textQueue.enqueue(text)
+                self.queueCount = self.textQueue.count
+                self.showReadAloudMessage("Added to reading queue (\(self.queueCount))")
+                return
+            case .replaceCurrent:
                 self.resetCurrentSession(clearQueue: true, hideIndicator: true)
                 try? await Task.sleep(nanoseconds: 60_000_000)
                 guard !Task.isCancelled else { return }
+            case .start:
+                break
             }
             await self.speak(text)
         }
@@ -251,6 +265,81 @@ final class ReadAloudManager: ObservableObject {
         resetCurrentSession(clearQueue: true, hideIndicator: true)
     }
 
+    static let seekStep: TimeInterval = 5
+
+    func rewindFiveSeconds() {
+        seek(by: -Self.seekStep)
+    }
+
+    func forwardFiveSeconds() {
+        seek(by: Self.seekStep)
+    }
+
+    private func seek(by seconds: TimeInterval) {
+        guard state == .speaking || state == .buffering || state == .paused,
+              !playbackSourceText.isEmpty else {
+            return
+        }
+
+        if currentProviderRef?.seek(by: seconds) == true {
+            updateElapsedTimeAfterSeek(by: seconds)
+            return
+        }
+
+        let source = playbackSourceText
+        let reportedOffset = activeTextStartOffset + Int(
+            (Double(activeTextCount) * providerProgress).rounded()
+        )
+        let elapsedOffset = PlaybackSeekTarget.characterOffset(
+            current: activeTextStartOffset,
+            textCount: source.count,
+            deltaSeconds: elapsedSeconds,
+            rate: ReadAloudSettings.shared.rate
+        )
+        let currentOffset = min(source.count, max(reportedOffset, elapsedOffset))
+        let rawTarget = PlaybackSeekTarget.characterOffset(
+            current: currentOffset,
+            textCount: source.count,
+            deltaSeconds: seconds,
+            rate: ReadAloudSettings.shared.rate
+        )
+        let target = PlaybackSeekTarget.wordBoundary(
+            in: source,
+            near: rawTarget,
+            movingForward: seconds > 0
+        )
+
+        guard target < source.count else {
+            stop()
+            return
+        }
+
+        let characters = Array(source)
+        let remaining = String(characters[target...])
+        let shouldRemainPaused = state == .paused
+        resetCurrentSession(clearQueue: false, hideIndicator: false)
+
+        let transition = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            self.playbackTransitionTask = nil
+            await self.speak(remaining, sourceText: source, sourceOffset: target)
+        }
+        playbackTransitionTask = transition
+
+        if shouldRemainPaused {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                self?.pause()
+            }
+        }
+    }
+
+    private func updateElapsedTimeAfterSeek(by seconds: TimeInterval) {
+        let adjusted = max(0, elapsedSeconds + seconds)
+        accumulatedPlaybackSeconds = adjusted
+        playbackStartedAt = state == .paused ? nil : Date()
+    }
+
     func skipToNext() {
         guard let next = textQueue.dequeue() else {
             stop()
@@ -278,6 +367,10 @@ final class ReadAloudManager: ObservableObject {
         playbackStartedAt = nil
         accumulatedPlaybackSeconds = 0
         pausedAfterPlaybackStarted = false
+        playbackSourceText = ""
+        activeTextStartOffset = 0
+        activeTextCount = 0
+        providerProgress = 0
         if clearQueue {
             textQueue.clear()
             queueCount = 0
@@ -293,7 +386,14 @@ final class ReadAloudManager: ObservableObject {
         if playbackStartedAt == nil, state == .speaking {
             playbackStartedAt = Date()
         }
-        progress = value
+        providerProgress = min(1, max(0, value))
+        if !playbackSourceText.isEmpty {
+            let absoluteOffset = Double(activeTextStartOffset)
+                + Double(activeTextCount) * providerProgress
+            progress = min(1, max(0, absoluteOffset / Double(playbackSourceText.count)))
+        } else {
+            progress = providerProgress
+        }
         indicatorWindow.progressDidChange()
     }
 
@@ -391,14 +491,23 @@ final class ReadAloudManager: ObservableObject {
 
     // MARK: - Internal
 
-    private func speak(_ text: String) async {
+    private func speak(
+        _ text: String,
+        sourceText: String? = nil,
+        sourceOffset: Int = 0
+    ) async {
         let settings = ReadAloudSettings.shared
         let segmentPlan = ReadAloudSegmentPlanner.plan(text: text)
         let primaryKind = settings.provider
         let sessionID = UUID()
         activeSessionID = sessionID
 
-        currentText = text
+        let resolvedSource = sourceText ?? text
+        playbackSourceText = resolvedSource
+        activeTextStartOffset = min(resolvedSource.count, max(0, sourceOffset))
+        activeTextCount = text.count
+        providerProgress = 0
+        currentText = resolvedSource
         state = .loading
         activeProvider = primaryKind
         let primaryProvider = provider(for: primaryKind)

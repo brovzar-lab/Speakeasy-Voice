@@ -87,7 +87,7 @@ struct FeatureBacklogSettingsSection: View {
                     .foregroundStyle(.secondary)
             }
         } footer: {
-            Text("When you tell Codex “execute backlog,” it will show the pending items and ask which one you want built.")
+            Text("When you tell Codex “execute backlog,” it will prioritize and build all pending items, testing each one before completion.")
         }
         .task {
             await store.load()

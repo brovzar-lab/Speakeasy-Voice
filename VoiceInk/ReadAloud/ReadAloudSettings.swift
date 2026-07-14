@@ -29,6 +29,24 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
     }
 }
 
+enum ReadAloudSelectionAction: Equatable {
+    case start
+    case replaceCurrent
+    case enqueue
+}
+
+enum ReadAloudSelectionPolicy {
+    static let defaultActionWhileActive: ReadAloudSelectionAction = .replaceCurrent
+
+    static func action(
+        isReading: Bool,
+        enqueueSelectedText: Bool
+    ) -> ReadAloudSelectionAction {
+        guard isReading else { return .start }
+        return enqueueSelectedText ? .enqueue : .replaceCurrent
+    }
+}
+
 enum ReadAloudFallbackPolicy {
     static func resolve(
         primary: ReadAloudProvider,
@@ -206,6 +224,7 @@ final class ReadAloudSettings: ObservableObject {
         static let automaticFallbackEnabled = "readAloud.automaticFallbackEnabled"
         static let fallbackProvider = "readAloud.fallbackProvider"
         static let enqueueSelectedText = "readAloud.enqueueSelectedText"
+        static let migratedInterruptOnNewSelection = "readAloud.migratedInterruptOnNewSelection_v1"
     }
 
     @Published var provider: ReadAloudProvider {
@@ -302,9 +321,11 @@ final class ReadAloudSettings: ObservableObject {
         self.fallbackProvider = ReadAloudProvider(
             rawValue: defaults.string(forKey: Keys.fallbackProvider) ?? ""
         ) ?? .elevenlabs
-        self.enqueueSelectedText = defaults.object(forKey: Keys.enqueueSelectedText) == nil
-            ? true
-            : defaults.bool(forKey: Keys.enqueueSelectedText)
+        if !defaults.bool(forKey: Keys.migratedInterruptOnNewSelection) {
+            defaults.set(false, forKey: Keys.enqueueSelectedText)
+            defaults.set(true, forKey: Keys.migratedInterruptOnNewSelection)
+        }
+        self.enqueueSelectedText = defaults.bool(forKey: Keys.enqueueSelectedText)
     }
 
     /// Build a `VoiceConfiguration` for the active provider.

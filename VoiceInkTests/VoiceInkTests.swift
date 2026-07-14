@@ -375,8 +375,17 @@ struct VoiceInkTests {
         #expect(Date().timeIntervalSince(start) < 0.5)
     }
 
-    @Test func appVersionLabelUsesRequestedMarketingVersion() {
-        #expect(AppVersionDisplay.text(version: "1.5") == "Version 1.5")
+    @Test func appTargetUsesMarketingVersion16() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let project = try String(
+            contentsOf: repository.appendingPathComponent("VoiceInk.xcodeproj/project.pbxproj"),
+            encoding: .utf8
+        )
+
+        #expect(project.components(separatedBy: "MARKETING_VERSION = 1.6;").count - 1 == 2)
+        #expect(AppVersionDisplay.text(version: "1.6") == "Version 1.6")
     }
 
     @Test func geminiRetriesTransientInternalErrorAndReturnsAudio() async throws {
@@ -458,6 +467,34 @@ struct VoiceInkTests {
         #expect(queue.dequeue() == "First selection")
         #expect(queue.dequeue() == "Second selection")
         #expect(queue.dequeue() == nil)
+    }
+
+    @Test func newSelectionInterruptsCurrentReadByDefault() {
+        #expect(ReadAloudSelectionPolicy.defaultActionWhileActive == .replaceCurrent)
+        #expect(
+            ReadAloudSelectionPolicy.action(
+                isReading: true,
+                enqueueSelectedText: false
+            ) == .replaceCurrent
+        )
+    }
+
+    @Test func fiveSecondSeekMovesExactlyFiveSecondsAndClampsToAudioBounds() {
+        #expect(ReadAloudManager.seekStep == 5)
+        #expect(PlaybackSeekTarget.seconds(current: 12, duration: 30, delta: -5) == 7)
+        #expect(PlaybackSeekTarget.seconds(current: 12, duration: 30, delta: 5) == 17)
+        #expect(PlaybackSeekTarget.seconds(current: 2, duration: 30, delta: -5) == 0)
+        #expect(PlaybackSeekTarget.seconds(current: 29, duration: 30, delta: 5) == 30)
+        #expect(
+            PlaybackSeekTarget.characterOffset(
+                current: 100,
+                textCount: 300,
+                deltaSeconds: 5,
+                rate: 1
+            ) == 175
+        )
+        #expect(PlaybackSeekTarget.wordBoundary(in: "zero one two", near: 7, movingForward: false) == 5)
+        #expect(PlaybackSeekTarget.wordBoundary(in: "zero one two", near: 7, movingForward: true) == 9)
     }
 
     @Test func geminiDoesNotRetryInvalidRequest() async {

@@ -22,6 +22,52 @@ struct VoiceConfiguration {
     var languageCode: String?
 }
 
+enum PlaybackSeekTarget {
+    static func seconds(
+        current: TimeInterval,
+        duration: TimeInterval,
+        delta: TimeInterval
+    ) -> TimeInterval {
+        guard duration > 0 else { return 0 }
+        return min(duration, max(0, current + delta))
+    }
+
+    static func characterOffset(
+        current: Int,
+        textCount: Int,
+        deltaSeconds: TimeInterval,
+        rate: Float
+    ) -> Int {
+        guard textCount > 0 else { return 0 }
+        let estimatedCharactersPerSecond = 15.0 * Double(max(0.5, min(2.0, rate)))
+        let deltaCharacters = Int((deltaSeconds * estimatedCharactersPerSecond).rounded())
+        return min(textCount, max(0, current + deltaCharacters))
+    }
+
+    static func wordBoundary(
+        in text: String,
+        near offset: Int,
+        movingForward: Bool
+    ) -> Int {
+        let characters = Array(text)
+        var position = min(characters.count, max(0, offset))
+
+        if movingForward {
+            while position < characters.count, !characters[position].isWhitespace {
+                position += 1
+            }
+            while position < characters.count, characters[position].isWhitespace {
+                position += 1
+            }
+        } else {
+            while position > 0, !characters[position - 1].isWhitespace {
+                position -= 1
+            }
+        }
+        return position
+    }
+}
+
 /// A speech provider that plays a chunk of text through the system audio output.
 ///
 /// Implementations are expected to be main-actor-safe (Apple's synth requires it)
@@ -46,6 +92,9 @@ protocol TextToSpeechProvider: AnyObject {
     /// Providers that can't honor a live change should be a no-op; the manager
     /// still writes the new value into settings so the next read uses it.
     func setLiveRate(_ rate: Float)
+    /// Move playback relative to its current position. Returns false when the
+    /// provider is using a live stream that must be restarted by the manager.
+    func seek(by seconds: TimeInterval) -> Bool
     /// Whether audio is currently being emitted.
     var isSpeaking: Bool { get }
     /// Whether playback is paused (still holding buffered audio).
@@ -54,6 +103,10 @@ protocol TextToSpeechProvider: AnyObject {
     var onProgressUpdate: ((Double) -> Void)? { get set }
     /// Fires when playback drains its prepared audio while the next section loads.
     var onBufferingUpdate: ((Bool) -> Void)? { get set }
+}
+
+extension TextToSpeechProvider {
+    func seek(by seconds: TimeInterval) -> Bool { false }
 }
 
 // MARK: - Apple (local) provider
@@ -81,9 +134,9 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
     /// The voice config we started with — needed for restart so we keep the
     /// same voice / pitch when only rate changes.
     private var currentVoice: VoiceConfiguration?
-    /// True while a `speak` continuation is intentionally being kept alive
-    /// across an internal restart (we don't want to resume it in didCancel).
-    private var isRestarting = false
+    /// Internal restarts intentionally cancel one utterance without ending the
+    /// logical read. Count callbacks so rapid seek/rate clicks remain safe.
+    private var suppressedCancellationCallbacks = 0
 
     var onProgressUpdate: ((Double) -> Void)?
     var onBufferingUpdate: ((Bool) -> Void)?
@@ -103,7 +156,7 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
         guard !trimmed.isEmpty else { return }
 
         isCancelled = false
-        isRestarting = false
+        suppressedCancellationCallbacks = 0
         originalText = trimmed
         baseOffset = 0
         lastSpokenOffset = 0
@@ -140,7 +193,7 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
             return
         }
         isCancelled = true
-        isRestarting = false
+        suppressedCancellationCallbacks = 0
         synthesizer.stopSpeaking(at: .immediate)
         // Delegate `didCancel` will fire and resolve the continuation.
     }
@@ -167,10 +220,39 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
 
         // Suppress the "did cancel" path from resolving the outer continuation
         // — we're just swapping utterances, playback is still logically ongoing.
-        isRestarting = true
+        suppressedCancellationCallbacks += 1
         synthesizer.stopSpeaking(at: .immediate)
         enqueueUtterance(startingAtOffset: restartOffset, voice: voice)
-        isRestarting = false
+    }
+
+    func seek(by seconds: TimeInterval) -> Bool {
+        guard !originalText.isEmpty,
+              let voice = currentVoice,
+              synthesizer.isSpeaking || synthesizer.isPaused else {
+            return false
+        }
+
+        let target = PlaybackSeekTarget.characterOffset(
+            current: max(baseOffset, lastSpokenOffset),
+            textCount: originalText.count,
+            deltaSeconds: seconds,
+            rate: voice.rate
+        )
+        guard target < originalText.count else {
+            stop()
+            return true
+        }
+
+        let wasPaused = synthesizer.isPaused
+        suppressedCancellationCallbacks += 1
+        synthesizer.stopSpeaking(at: .immediate)
+        lastSpokenOffset = target
+        enqueueUtterance(startingAtOffset: target, voice: voice)
+        if wasPaused {
+            synthesizer.pauseSpeaking(at: .word)
+        }
+        onProgressUpdate?(Double(target) / Double(originalText.count))
+        return true
     }
 
     private func enqueueUtterance(startingAtOffset offset: Int, voice: VoiceConfiguration) {
@@ -208,7 +290,10 @@ final class AppleTTSProvider: NSObject, TextToSpeechProvider, AVSpeechSynthesize
             guard let self else { return }
             // A cancel triggered by a rate-restart should NOT resolve the
             // outer continuation — the follow-up utterance is already queued.
-            if self.isRestarting { return }
+            if self.suppressedCancellationCallbacks > 0 {
+                self.suppressedCancellationCallbacks -= 1
+                return
+            }
             self.resolveContinuation()
         }
     }

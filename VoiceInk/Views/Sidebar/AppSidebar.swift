@@ -10,7 +10,7 @@ struct AppSidebar: View {
     @Binding var selectedView: ViewType
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.5"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.6"
     }
 
     var body: some View {

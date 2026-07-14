@@ -141,6 +141,15 @@ final class CloudTTSChunkedPlayer: NSObject, AVAudioPlayerDelegate {
         currentPlayer?.rate = max(0.5, min(2.0, newRate))
     }
 
+    func seek(by seconds: TimeInterval) -> Bool {
+        guard let currentPlayer, currentPlayer.duration > 0 else { return false }
+        let unbounded = currentPlayer.currentTime + seconds
+        // Crossing a generated section needs the manager's text-level restart.
+        guard unbounded >= 0, unbounded < currentPlayer.duration else { return false }
+        currentPlayer.currentTime = unbounded
+        return true
+    }
+
     func stop() {
         isStopped = true
         setBuffering(false)
