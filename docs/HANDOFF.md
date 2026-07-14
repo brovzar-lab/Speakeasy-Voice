@@ -1,70 +1,108 @@
-# HANDOFF — Speakeasy-Voice (2026-07-10)
+# HANDOFF: Speakeasy-Voice
 
-## Where we left off
+Last updated: 2026-07-14
 
-Read Aloud Gemini crash + speed work on `cursor/read-aloud-speed-optimizations` is **code-complete and pushed**. Open loops from the earlier handoff were closed in this session (notes filed, limits documented, API smoke-tested, PR opened).
+## Current state
 
-**Root cause (locked):** Gemini-only crash. Streaming PCM one byte at a time on the MainActor corrupted Swift’s executor checks on macOS 26. Apple voices never hit that path.
+Speakeasy-Voice **1.6** is built, installed at `~/Downloads/Speakeasy-Voice.app`, and the completed feature work is on `main` at `b947ab7`. The repository was clean and synchronized with `origin/main` before this documentation update.
 
-**Fix (shipped `d15ed4d`):** `AsyncStream<Data>` chunks decoded off MainActor; schedule buffers on MainActor only; batch fallback; same chunking for ElevenLabs; `inlineData` / `inline_data` parsing.
+Dictation is working well. The latest work focused on making cloud Read Aloud reliable and fast for long selections, adding practical playback controls, and letting Billy capture future changes inside the app.
 
-**API smoke test (2026-07-10, Billy’s saved Gemini key, voice Laomedeia):**
-- Batch `generateContent`: HTTP 200, ~2.6s, PCM present
-- Stream `streamGenerateContent?alt=sse`: HTTP 200, first PCM ~2.0s, PCM present
+## What shipped
 
-Settings already point at Gemini / 3.1 Flash / Laomedeia on this Mac.
+### 1. Reliable and faster Read Aloud
+
+- Gemini and ElevenLabs PCM streaming uses `AsyncStream<Data>` chunks off the MainActor. Never return to byte-at-a-time MainActor streaming; that was the macOS 26 crash root cause.
+- Gemini transient `INTERNAL` failures retry within a bounded request budget and can fall back to ElevenLabs when configured.
+- Provider error JSON is converted to a user-facing message instead of being shown raw.
+- Gemini 3.1 Flash streaming is the Gemini default. ElevenLabs Flash v2.5 streaming is the fastest recommended cloud path. Apple remains the most stable local baseline.
+
+### 2. Continuous long-text playback
+
+- `ReadAloudSegmentPlanner` splits long selections at paragraph/sentence boundaries into roughly 400–750 character sections, targeting 600 characters.
+- `CloudTTSRollingPipeline` prepares the current section and at most two future sections while audio is playing.
+- PCM sections share one continuous playback session. MP3 sections are supplied to one ordered chunk player.
+- The user should not hear paragraph-by-paragraph stops under normal network conditions. A `.buffering` state is shown if the next section is not ready.
+- Failure recovery begins at the first unheard section. It must never replay a section whose audio already started.
+- Usage tracking records one logical read, even when that read required several provider requests.
+
+### 3. Better selection and player behavior
+
+- Selecting new text interrupts and replaces the current reading by default.
+- **Queue New Selections** in Read Aloud settings is now opt-in. Migration key: `readAloud.migratedInterruptOnNewSelection_v1`.
+- Rapid selection shortcuts cancel older capture tasks, so the newest selection wins.
+- The 420-pixel floating player includes rewind 5 seconds, pause/resume, forward 5 seconds, next queued selection, stop, and speed controls.
+- Downloaded MP3 audio seeks exactly five seconds. Apple speech and live cloud PCM approximate the position from spoken text and may rerender the remaining cloud text.
+
+### 4. In-app feature backlog
+
+- Settings now includes **Feature Backlog**, where Billy can write a change in plain language.
+- Entries are stored in repository-root `BACKLOG.md` by default. The UI can edit, complete, delete, open, or switch the file.
+- Writes are atomic, external file changes are reloaded before mutations, and every item preserves a UUID plus added/completed dates.
+- Saying **“execute backlog”** means implement every pending item in the safest logical order, test each independently, then mark it complete. Do not ask Billy to choose entries one by one unless work is destructive, irreversible, spends money, conflicts, or is genuinely blocked.
+- Current backlog: **0 pending, 3 completed**.
+
+### 5. Version and build identity
+
+- User-visible version: **1.6**.
+- App target: `MARKETING_VERSION = 1.6`, build `201`.
+- User-visible product name: `Speakeasy-Voice`.
+- Keep bundle id, Swift module, UserDefaults keys, and internal `VoiceInk` names unchanged.
+- Local builds use the stable self-signed `Speakeasy-Voice Local` identity so Accessibility and Input Monitoring permissions survive rebuilds.
+
+## Proof from the last implementation pass
+
+- Feature commits on `main`:
+  - `2b0cba7` Add in-app feature backlog
+  - `10dc0b8` Stream long cloud read-aloud selections
+  - `b947ab7` Complete read-aloud playback backlog
+- **46 unit tests passed**, including backlog persistence, rolling order/prefetch/recovery, Gemini retry/fallback, interrupt-versus-queue behavior, five-second seek, usage aggregation, and version 1.6.
+- The full UI run passed **7 of 8** cases. The autogenerated `VoiceInkUITestsLaunchTests.testLaunch` timed out while activating the background menu-bar app; the other launch variants and the signed manual launch passed. Treat this as a UI-test harness issue, not proof of an app crash.
+- `make local` succeeded and the signed 1.6 app launched from `~/Downloads/Speakeasy-Voice.app`.
+- Visual proof:
+  - `~/Downloads/Speakeasy-Voice-1.6-Window-Proof.png`
+  - `~/Downloads/Speakeasy-Voice-1.6-Player-Controls-Proof.png`
+
+## Known risks and guardrails
+
+1. Google can truncate a single Gemini SSE request around 60 seconds with `finishReason: OTHER`. The rolling segment pipeline is the workaround; keep it enabled.
+2. Never schedule streaming PCM byte-by-byte on the MainActor. Decode chunks off actor and schedule buffers on the MainActor.
+3. Never replay already-heard content during provider recovery.
+4. `APIKeyManager` must keep trimming whitespace on both save and load.
+5. OpenAI `tts-1` and `tts-1-hd` accept only the nine base voices. The extended voices require `gpt-4o-mini-tts`.
+6. Existing compiler warning: `ReadAloudUsageTracker.swift:46` uses a main-actor-isolated `.shared` value as a default argument. This may become an error under Swift 6 and should be cleaned up in a future maintenance pass.
+7. `README.md` still describes the upstream VoiceInk project. It needs a separate public-facing Speakeasy rewrite; it was intentionally not mixed into this internal state update.
 
 ## Next action
 
-One human UI check, then merge the PR:
+There is no pending backlog work. For the next session:
 
-1. `cd ~/CODE/SPEAKEASY-VOICE && make local && open ~/Downloads/Speakeasy-Voice.app`
-2. Select a short paragraph → Read Aloud (Gemini should already be selected)
-3. Confirm speech starts in a couple seconds and clicking Speakeasy UI does not crash
-4. Merge PR #1 into `main`: https://github.com/brovzar-lab/Speakeasy-Voice/pull/1
+1. Read `AGENTS.md` or `CLAUDE.md` for durable project rules.
+2. Read `BACKLOG.md`.
+3. If it contains pending entries and Billy says “execute backlog,” prioritize and complete all of them automatically.
+4. For any Swift change, run tests, then `make local`, relaunch the signed app, and show proof before claiming success.
 
-If step 3 fails, do **not** re-disable streaming; capture whether it fails on load, during speak, or on click, and reopen from `docs/HANDOFF.md`.
+## Key files
 
-## Locked decisions
+- `AGENTS.md` and `CLAUDE.md`: durable agent instructions and architecture
+- `BACKLOG.md`: user-authored feature queue
+- `VoiceInk/Backlog/`: backlog parser and store
+- `VoiceInk/ReadAloud/ReadAloudManager.swift`: orchestration and selection behavior
+- `VoiceInk/ReadAloud/ReadAloudSegmentPlanner.swift`: long-text boundaries
+- `VoiceInk/ReadAloud/CloudTTSRollingPipeline.swift`: rolling prefetch/recovery
+- `VoiceInk/ReadAloud/CloudTTSProvider.swift`: provider APIs and cloud playback
+- `VoiceInk/ReadAloud/ReadAloudIndicatorWindow.swift`: floating player controls
+- `VoiceInk/Views/Settings/ReadAloudSettingsView.swift`: provider and queue settings
+- `VoiceInk/Views/Settings/FeatureBacklogSettingsSection.swift`: backlog UI
+- `VoiceInkTests/VoiceInkTests.swift`: focused regression suite
 
-- Keep Speakeasy-Voice product name; keep VoiceInk internal names / bundle id
-- Build with `make local` → `~/Downloads/Speakeasy-Voice.app`
-- Gemini/ElevenLabs streaming must stay **Data chunks off MainActor** (never per-byte on MainActor)
-- Apple TTS is the no-crash baseline
-- Read Aloud stays orthogonal to `VoiceInkEngine` (no mic)
-- Trim API keys on save and load
-- Long Gemini reads (~60s+) may truncate on Google’s SSE; treat as known provider limit
-
-## Open loops
-
-None blocking. Optional follow-ups only:
-
-1. **Human UI confirm** — one Gemini Read Aloud pass in the app (API already green). Done when Billy says “works” or reports a failure mode.
-2. **Merge PR #1** — https://github.com/brovzar-lab/Speakeasy-Voice/pull/1 — merge when UI confirm is good (or when Billy says merge anyway).
-
-## How to run and verify
+## Run and verify
 
 ```bash
 cd ~/CODE/SPEAKEASY-VOICE
+xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS'
 make local
 open ~/Downloads/Speakeasy-Voice.app
 ```
 
-- No dev server / port (native macOS app)
-- Gemini key is the same `"gemini"` key as AI Models (local builds store under `LocalKeychain_geminiAPIKey` in app defaults)
-- Debug write-up: `.planning/debug/read-aloud-mainactor-crash.md`
-- Prior quick audit (unrelated to this crash): `docs/audits/2026-07-07-audit.md`
-
-Key files:
-- `VoiceInk/ReadAloud/CloudTTSProvider.swift`
-- `VoiceInk/ReadAloud/ReadAloudManager.swift`
-- `VoiceInk/ReadAloud/ReadAloudIndicatorWindow.swift`
-- `VoiceInk/Services/SelectedTextService.swift`
-- `CLAUDE.md`
-
-## Gotchas / context not on disk
-
-- Billy’s Mac already has `readAloud.provider = gemini`, model `gemini-3.1-flash-tts-preview`, voice `Laomedeia`
-- HIE / Accessibility noise in crash logs was a red herring once Apple vs Gemini was compared
-- Temporary “batch-only Gemini” fix stopped crashes but made Read Aloud feel too slow; streaming was restored the safe way
-- When asked “where did we leave off?”, read this file and start at **Next action**
+No dev server or port is used; this is a native macOS menu-bar app.
