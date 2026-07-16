@@ -4,7 +4,7 @@ Last updated: 2026-07-16
 
 ## Current state
 
-Speakeasy-Voice **1.7 build 203** is built and installed at `~/Downloads/Speakeasy-Voice.app`. Dictation remains working well. Read Aloud defaults to a free, on-device Kokoro voice, protects paid providers with a hard monthly limit, and uses a direct Float32 audio graph that fixes both the Gemini crash and silent Local HD playback.
+Speakeasy-Voice **1.7 build 204** is built and installed at `~/Downloads/Speakeasy-Voice.app`. Dictation remains working well. Read Aloud defaults to a free, on-device Kokoro voice, protects paid providers with a hard monthly limit, and uses a direct Float32 audio graph that fixes both the Gemini crash and silent Local HD playback.
 
 ## What shipped
 
@@ -14,7 +14,7 @@ Speakeasy-Voice **1.7 build 203** is built and installed at `~/Downloads/Speakea
 - Gemini and ElevenLabs supply signed 16-bit PCM. The old graph connected that wire format directly to `AVAudioUnitVarispeed`, which can throw `kAudioUnitErr_FormatNotSupported` and crash AVFAudio.
 - `CloudPCMPlaybackFormat` converts PCM16 little-endian samples to mono, deinterleaved Float32 before scheduling them.
 - A July 16 live app trace proved that even the Float32 `AVAudioUnitVarispeed` graph could fail to initialize with `-10868`, leaving Local HD silent. Streaming PCM now connects the player node directly to the main mixer.
-- PCM speed is applied with software linear resampling before scheduling. Do not restore the streaming effect unit, reconnect Int16 directly, or force the mixer edge back to the network sample format.
+- PCM speed is applied with pitch-preserving WSOLA time stretching before scheduling, and that work runs off the MainActor. This lets Local HD, Gemini, and ElevenLabs streaming voices speak faster without the chipmunk pitch shift. Do not restore the streaming effect unit, simple resampling, Int16 graph connections, or a forced network sample format at the mixer edge.
 - Streaming still uses coarse `AsyncStream<Data>` chunks off the MainActor. Never return to byte-at-a-time MainActor work.
 
 ### 2. Free Local HD Read Aloud
@@ -56,7 +56,7 @@ Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 ### 6. Version and build
 
 - User-visible version: **1.7**.
-- App target: `MARKETING_VERSION = 1.7`, build `202`.
+- App target: `MARKETING_VERSION = 1.7`, build `204`.
 - Keep bundle id, Swift module, UserDefaults keys, and internal `VoiceInk` names unchanged.
 - Local builds use the stable self-signed `Speakeasy-Voice Local` identity.
 - `make test` runs the deterministic signed unit suite. `make test-ui` is separate because macOS can time out while enabling UI automation before any test starts.
@@ -64,7 +64,7 @@ Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 ## Proof from this implementation pass
 
 - `make local` completed with `** BUILD SUCCEEDED **` and copied version 1.7 to `~/Downloads/Speakeasy-Voice.app`.
-- **54 unit tests passed**, including real audio-engine duration/speed checks, PCM format/conversion, Gemini recovery, free-provider fallback, local-to-Apple fallback, hard-budget blocking, long-text continuity, backlog, and version 1.7.
+- **55 unit tests passed**, including a pitch regression proving 440 Hz remains 440 Hz at 1.25×, 1.5×, 1.75×, and 2×, real audio-engine duration/speed checks, PCM format/conversion, Gemini recovery, free-provider fallback, local-to-Apple fallback, hard-budget blocking, long-text continuity, backlog, and version 1.7.
 - The exact Float32 audio-engine graph starts successfully in a standalone AVFoundation proof.
 - The installed bundle contains `default.metallib`, reports version 1.7, and remained running after relaunch.
 - The optional UI runner timed out while macOS was enabling automation mode, before a UI test began. This is kept separate as `make test-ui`.

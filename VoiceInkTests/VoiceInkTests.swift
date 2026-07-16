@@ -40,6 +40,42 @@ struct VoiceInkTests {
         #expect(abs(output[4] - (Float(Int16.max) / 32_768.0)) < 0.000_01)
     }
 
+    @Test func fasterPCMPlaybackPreservesTheOriginalPitch() {
+        let sampleRate = 24_000.0
+        let sourcePitch = 440.0
+        let source = (0..<24_000).map { frame in
+            Float(sin(2.0 * Double.pi * sourcePitch * Double(frame) / sampleRate))
+        }
+
+        for rate: Float in [1.25, 1.5, 1.75, 2.0] {
+            let faster = CloudPCMPlaybackFormat.pitchPreservingTimeStretch(
+                source,
+                playbackRate: rate,
+                sampleRate: sampleRate
+            )
+            var strongestFrequency = 0
+            var strongestMagnitude = -Double.infinity
+            for frequency in 400...480 {
+                var real = 0.0
+                var imaginary = 0.0
+                for (frame, sample) in faster.enumerated() {
+                    let angle = 2.0 * Double.pi * Double(frequency) * Double(frame) / sampleRate
+                    real += Double(sample) * cos(angle)
+                    imaginary -= Double(sample) * sin(angle)
+                }
+                let magnitude = (real * real) + (imaginary * imaginary)
+                if magnitude > strongestMagnitude {
+                    strongestMagnitude = magnitude
+                    strongestFrequency = frequency
+                }
+            }
+            let expectedFrameCount = Int((Double(source.count) / Double(rate)).rounded())
+
+            #expect(abs(Double(strongestFrequency) - sourcePitch) <= 2)
+            #expect(faster.count == expectedFrameCount)
+        }
+    }
+
     @MainActor
     @Test func streamingFloat32PlaybackKeepsEngineAliveUntilAudioFinishes() async {
         let player = CloudTTSPlayer()

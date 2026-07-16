@@ -545,25 +545,103 @@ enum CloudPCMPlaybackFormat {
         return samples
     }
 
-    /// Change streaming speed before buffers enter AVAudioEngine. This avoids
-    /// the AVAudioUnitVarispeed format failure seen on macOS 26 while preserving
-    /// 0.5x–2.0x control for Local HD, Gemini, and ElevenLabs PCM streams.
-    static func resample(_ samples: [Float], playbackRate: Float) -> [Float] {
+    /// Pitch-preserving speech time stretching using waveform-similarity
+    /// overlap-add (WSOLA). Matching nearby waveform sections before each
+    /// crossfade changes duration without shifting every frequency like simple
+    /// resampling does. The live output graph remains player-node → mixer.
+    static func pitchPreservingTimeStretch(
+        _ samples: [Float],
+        playbackRate: Float,
+        sampleRate: Double = 24_000
+    ) -> [Float] {
         guard !samples.isEmpty else { return [] }
         let rate = max(0.5, min(2.0, playbackRate))
         guard abs(rate - 1.0) > 0.000_1 else { return samples }
 
-        let outputCount = max(1, Int((Double(samples.count) / Double(rate)).rounded()))
-        var output = Array(repeating: Float.zero, count: outputCount)
-        for outputIndex in 0..<outputCount {
-            let sourcePosition = Double(outputIndex) * Double(rate)
-            let lowerIndex = min(Int(sourcePosition), samples.count - 1)
-            let upperIndex = min(lowerIndex + 1, samples.count - 1)
-            let fraction = Float(sourcePosition - Double(lowerIndex))
-            output[outputIndex] = samples[lowerIndex]
-                + ((samples[upperIndex] - samples[lowerIndex]) * fraction)
+        let targetCount = max(1, Int((Double(samples.count) / Double(rate)).rounded()))
+        guard samples.count >= 64, sampleRate.isFinite, sampleRate > 0 else {
+            return Array(samples.prefix(min(samples.count, targetCount)))
         }
-        return output
+
+        let preferredFrameLength = max(64, Int(sampleRate * 0.040))
+        let frameLength = min(preferredFrameLength, max(64, samples.count / 2))
+        let preferredOverlap = max(32, Int(sampleRate * 0.010))
+        let overlapLength = min(preferredOverlap, max(32, frameLength / 2))
+        let synthesisHop = max(1, frameLength - overlapLength)
+        let analysisHop = Double(synthesisHop) * Double(rate)
+        let searchRadius = max(16, Int(sampleRate * 0.005))
+
+        var output = Array(repeating: Float.zero, count: targetCount + frameLength)
+        let firstFrameCount = min(frameLength, samples.count, output.count)
+        output.replaceSubrange(0..<firstFrameCount, with: samples[0..<firstFrameCount])
+
+        var outputPosition = synthesisHop
+        var previousInputPosition = 0
+
+        while outputPosition < targetCount {
+            let expectedInputPosition = Int(
+                (Double(previousInputPosition) + analysisHop).rounded()
+            )
+            let lastCandidate = samples.count - frameLength
+            let firstCandidate = max(
+                previousInputPosition + 1,
+                expectedInputPosition - searchRadius
+            )
+            let finalCandidate = min(lastCandidate, expectedInputPosition + searchRadius)
+            guard firstCandidate <= finalCandidate else { break }
+
+            var referenceEnergy = 0.0
+            for offset in 0..<overlapLength {
+                let value = Double(output[outputPosition + offset])
+                referenceEnergy += value * value
+            }
+
+            var bestCandidate = min(max(expectedInputPosition, firstCandidate), finalCandidate)
+            var bestScore = -Double.infinity
+            if referenceEnergy > 0.000_000_1 {
+                for candidate in stride(
+                    from: firstCandidate,
+                    through: finalCandidate,
+                    by: 2
+                ) {
+                    var dotProduct = 0.0
+                    var candidateEnergy = 0.0
+                    for offset in stride(from: 0, to: overlapLength, by: 4) {
+                        let reference = Double(output[outputPosition + offset])
+                        let value = Double(samples[candidate + offset])
+                        dotProduct += reference * value
+                        candidateEnergy += value * value
+                    }
+                    guard candidateEnergy > 0.000_000_1 else { continue }
+                    let score = dotProduct / sqrt(referenceEnergy * candidateEnergy)
+                    if score > bestScore {
+                        bestScore = score
+                        bestCandidate = candidate
+                    }
+                }
+            }
+
+            let availableOutput = min(frameLength, output.count - outputPosition)
+            let crossfadeCount = min(overlapLength, availableOutput)
+            for offset in 0..<crossfadeCount {
+                let blend = Float(offset + 1) / Float(crossfadeCount + 1)
+                let existing = output[outputPosition + offset]
+                let incoming = samples[bestCandidate + offset]
+                output[outputPosition + offset] = existing + ((incoming - existing) * blend)
+            }
+            if availableOutput > crossfadeCount {
+                let copyCount = availableOutput - crossfadeCount
+                output.replaceSubrange(
+                    (outputPosition + crossfadeCount)..<(outputPosition + availableOutput),
+                    with: samples[(bestCandidate + crossfadeCount)..<(bestCandidate + crossfadeCount + copyCount)]
+                )
+            }
+
+            previousInputPosition = bestCandidate
+            outputPosition += synthesisHop
+        }
+
+        return Array(output.prefix(targetCount))
     }
 }
 
@@ -619,9 +697,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             let p = try AVAudioPlayer(data: data)
             p.delegate = self
             p.volume = max(0.0, min(1.0, volume))
-            // Enabling rate lets us change playback speed without a re-fetch.
-            // The pitch shifts naturally with rate (like a tape), which usually
-            // sounds fine for TTS at 0.5x–2.0x.
+            // AVAudioPlayer changes playback speed without altering pitch.
             p.enableRate = true
             p.rate = max(0.5, min(2.0, initialRate))
             p.prepareToPlay()
@@ -691,7 +767,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                                 didStartPlayback = true
                                 self.onProgress?(0)
                             }
-                            self.scheduleStreamingPCMBuffer(toPlay)
+                            await self.scheduleStreamingPCMBuffer(toPlay)
                         }
                     }
 
@@ -706,7 +782,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                                 didStartPlayback = true
                                 self.onProgress?(0)
                             }
-                            self.scheduleStreamingPCMBuffer(toPlay)
+                            await self.scheduleStreamingPCMBuffer(toPlay)
                         } else {
                             break
                         }
@@ -751,7 +827,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
                         try Task.checkCancellation()
                         guard !samples.isEmpty else { continue }
                         try await self.waitForStreamingCapacity()
-                        guard let buffer = self.makeFloat32Buffer(samples) else { continue }
+                        guard let buffer = await self.makeFloat32Buffer(samples) else { continue }
                         self.onProgress?(0)
                         self.scheduleStreamingPCMBuffer(buffer)
                     }
@@ -830,7 +906,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         if let player {
             player.rate = clamped
         }
-        // Future PCM chunks are resampled at this rate before being scheduled.
+        // Future PCM chunks are time-stretched at this rate before scheduling.
     }
 
     func seek(by seconds: TimeInterval) -> Bool {
@@ -910,30 +986,39 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         return true
     }
 
-    private func scheduleStreamingPCMBuffer(_ data: Data) {
+    private func scheduleStreamingPCMBuffer(_ data: Data) async {
         guard streamingNode != nil else { return }
         let samples = CloudPCMPlaybackFormat.decodePCM16LittleEndian(data)
-        guard let buffer = makeFloat32Buffer(samples) else { return }
+        guard let buffer = await makeFloat32Buffer(samples) else { return }
         scheduleStreamingPCMBuffer(buffer)
     }
 
-    private func makeFloat32Buffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
-        let resampled = CloudPCMPlaybackFormat.resample(samples, playbackRate: currentPCMRate)
-        guard !resampled.isEmpty,
-              let format = streamingFormat,
+    private func makeFloat32Buffer(_ samples: [Float]) async -> AVAudioPCMBuffer? {
+        guard let format = streamingFormat else { return nil }
+        let playbackRate = currentPCMRate
+        let sampleRate = format.sampleRate
+        let stretched = await Task.detached(priority: .userInitiated) {
+            CloudPCMPlaybackFormat.pitchPreservingTimeStretch(
+                samples,
+                playbackRate: playbackRate,
+                sampleRate: sampleRate
+            )
+        }.value
+
+        guard !stretched.isEmpty,
               let buffer = AVAudioPCMBuffer(
                   pcmFormat: format,
-                  frameCapacity: AVAudioFrameCount(resampled.count)
+                  frameCapacity: AVAudioFrameCount(stretched.count)
               ),
               let destination = buffer.floatChannelData?.pointee else {
             return nil
         }
 
-        resampled.withUnsafeBufferPointer { source in
+        stretched.withUnsafeBufferPointer { source in
             guard let sourceAddress = source.baseAddress else { return }
-            destination.update(from: sourceAddress, count: resampled.count)
+            destination.update(from: sourceAddress, count: stretched.count)
         }
-        buffer.frameLength = AVAudioFrameCount(resampled.count)
+        buffer.frameLength = AVAudioFrameCount(stretched.count)
         return buffer
     }
 
