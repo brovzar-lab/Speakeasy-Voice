@@ -2,6 +2,60 @@ import Foundation
 import Combine
 import OSLog
 
+enum PaidTTSBudgetDecision: Equatable {
+    case allowed
+    case blocked(estimatedRequestCost: Double, remainingBudget: Double)
+}
+
+enum PaidTTSBudgetPolicy {
+    static func decision(
+        provider: ReadAloudProvider,
+        model: String,
+        characterCount: Int,
+        currentMonthlySpend: Double,
+        monthlyBudget: Double,
+        hardLimitEnabled: Bool
+    ) -> PaidTTSBudgetDecision {
+        guard provider.isMetered, hardLimitEnabled else { return .allowed }
+
+        let requestCost = ReadAloudUsageTracker.estimatedCostUSD(
+            provider: provider.rawValue,
+            model: model,
+            characterCount: characterCount
+        )
+        let remaining = max(0, monthlyBudget - currentMonthlySpend)
+        guard monthlyBudget > 0, requestCost <= remaining else {
+            return .blocked(
+                estimatedRequestCost: currencyRounded(requestCost),
+                remainingBudget: currencyRounded(remaining)
+            )
+        }
+        return .allowed
+    }
+
+    private static func currencyRounded(_ value: Double) -> Double {
+        (value * 100).rounded() / 100
+    }
+}
+
+struct PaidTTSBudgetError: LocalizedError, Equatable {
+    let provider: ReadAloudProvider
+    let estimatedRequestCost: Double
+    let remainingBudget: Double
+
+    var errorDescription: String? {
+        if remainingBudget <= 0 {
+            return "Cloud spending is paused because the monthly limit has been reached. Choose Local HD or raise the limit in Read Aloud settings."
+        }
+        return String(
+            format: "This %@ read is estimated at $%.2f, but only $%.2f remains in the monthly limit. Choose Local HD or raise the limit.",
+            provider.shortName,
+            estimatedRequestCost,
+            remainingBudget
+        )
+    }
+}
+
 /// A single billable read-aloud event.
 ///
 /// One record is written per read session and aggregates its successful cloud requests.
@@ -43,7 +97,11 @@ final class ReadAloudUsageAccumulator {
         self.characterCount += characterCount
     }
 
-    func flush(to tracker: ReadAloudUsageTracker = .shared) {
+    func flush() {
+        flush(to: .shared)
+    }
+
+    func flush(to tracker: ReadAloudUsageTracker) {
         guard !didFlush, characterCount > 0 else { return }
         didFlush = true
         tracker.record(
@@ -72,14 +130,22 @@ final class ReadAloudUsageTracker: ObservableObject {
     private enum Keys {
         static let history = "readAloud.usageHistory"
         static let budget = "readAloud.monthlyBudgetUSD"
+        static let hardLimitEnabled = "readAloud.hardBudgetEnabled"
     }
 
     /// Newest last. Chronological append + prune keeps memory bounded.
     @Published private(set) var records: [ReadAloudUsageRecord] = []
 
-    /// Monthly budget in USD. `0` disables the budget entirely (no warnings).
+    /// Monthly budget in USD. With the hard limit enabled, `0` blocks all paid
+    /// cloud requests while local providers remain available.
     @Published var monthlyBudgetUSD: Double {
         didSet { UserDefaults.standard.set(monthlyBudgetUSD, forKey: Keys.budget) }
+    }
+
+    /// Blocks a paid request before it can push the estimated monthly spend
+    /// above `monthlyBudgetUSD`. Enabled by default.
+    @Published var hardLimitEnabled: Bool {
+        didSet { UserDefaults.standard.set(hardLimitEnabled, forKey: Keys.hardLimitEnabled) }
     }
 
     /// Maximum history retained. Keeps the UserDefaults value small even after
@@ -91,7 +157,12 @@ final class ReadAloudUsageTracker: ObservableObject {
 
     private init() {
         let defaults = UserDefaults.standard
-        self.monthlyBudgetUSD = defaults.double(forKey: Keys.budget)
+        self.monthlyBudgetUSD = defaults.object(forKey: Keys.budget) == nil
+            ? 5.00
+            : defaults.double(forKey: Keys.budget)
+        self.hardLimitEnabled = defaults.object(forKey: Keys.hardLimitEnabled) == nil
+            ? true
+            : defaults.bool(forKey: Keys.hardLimitEnabled)
         self.records = Self.loadRecords(defaults: defaults, logger: logger)
     }
 
@@ -135,13 +206,13 @@ final class ReadAloudUsageTracker: ObservableObject {
     /// Estimated USD cost for a cloud request. Reflects public rates as of
     /// 2026-07 — Apple returns 0 (local). Update `pricingReference` alongside
     /// any change here.
-    static func estimatedCostUSD(provider: String, model: String, characterCount: Int) -> Double {
+    nonisolated static func estimatedCostUSD(provider: String, model: String, characterCount: Int) -> Double {
         guard characterCount > 0 else { return 0 }
         let k = Double(characterCount) / 1_000.0
         let m = model.lowercased()
 
         switch provider.lowercased() {
-        case "apple":
+        case "local", "apple":
             return 0
         case "elevenlabs":
             if m.contains("flash") || m.contains("turbo") {
@@ -185,6 +256,7 @@ final class ReadAloudUsageTracker: ObservableObject {
     Gemini 2.5 Flash TTS: ~$0.008–0.015 / 1K chars (token-priced, approx)
     Gemini 3.1 Flash TTS: ~$0.015–0.025 / 1K chars (token-priced, approx)
     Apple (local): free
+    Local HD / Kokoro (on-device): free
     """
 
     // MARK: - Aggregations

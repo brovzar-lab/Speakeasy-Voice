@@ -6,10 +6,93 @@
 //
 
 import Foundation
+import AVFoundation
 import Testing
 @testable import VoiceInk
 
 struct VoiceInkTests {
+
+    @Test func cloudPCMPlaybackUsesMixerCompatibleFloat32Format() throws {
+        let format = try #require(CloudPCMPlaybackFormat.make(sampleRate: 24_000))
+
+        #expect(format.commonFormat == .pcmFormatFloat32)
+        #expect(format.isInterleaved == false)
+        #expect(format.sampleRate == 24_000)
+        #expect(format.channelCount == 1)
+    }
+
+    @Test func cloudPCMPlaybackConvertsSigned16BitSamplesToFloat32() throws {
+        let format = try #require(CloudPCMPlaybackFormat.make(sampleRate: 24_000))
+        let samples: [Int16] = [.min, -16_384, 0, 16_384, .max]
+        let littleEndianSamples = samples.map(\.littleEndian)
+        let data = littleEndianSamples.withUnsafeBytes { Data($0) }
+        let buffer = try #require(
+            AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))
+        )
+
+        #expect(CloudPCMPlaybackFormat.copyPCM16LittleEndian(data, into: buffer))
+        #expect(buffer.frameLength == AVAudioFrameCount(samples.count))
+        let output = try #require(buffer.floatChannelData?.pointee)
+        #expect(output[0] == -1.0)
+        #expect(abs(output[1] - (-0.5)) < 0.000_01)
+        #expect(output[2] == 0)
+        #expect(abs(output[3] - 0.5) < 0.000_01)
+        #expect(abs(output[4] - (Float(Int16.max) / 32_768.0)) < 0.000_01)
+    }
+
+    @Test func paidCloudRequestIsBlockedBeforeItExceedsTheHardBudget() {
+        let decision = PaidTTSBudgetPolicy.decision(
+            provider: .openai,
+            model: "tts-1",
+            characterCount: 10_000,
+            currentMonthlySpend: 4.90,
+            monthlyBudget: 5.00,
+            hardLimitEnabled: true
+        )
+
+        #expect(decision == .blocked(estimatedRequestCost: 0.15, remainingBudget: 0.10))
+    }
+
+    @Test func freeLocalProvidersNeverConsumeTheCloudBudget() {
+        for provider in [ReadAloudProvider.local, .apple] {
+            #expect(PaidTTSBudgetPolicy.decision(
+                provider: provider,
+                model: "local",
+                characterCount: 50_000,
+                currentMonthlySpend: 5,
+                monthlyBudget: 5,
+                hardLimitEnabled: true
+            ) == .allowed)
+        }
+    }
+
+    @Test func automaticFallbackPrefersFreeLocalProvidersAndDoesNotInventPaidFallbacks() throws {
+        let fallback = ReadAloudFallbackPolicy.resolve(
+            primary: .gemini,
+            preferred: .local,
+            isEnabled: true,
+            configuredProviders: [.local, .apple, .openai],
+            error: .httpError(500, nil)
+        )
+
+        #expect(fallback == .local)
+    }
+
+    @Test func automaticFallbackUsesAppleWhenLocalModelFails() async throws {
+        let usedProvider = try await ReadAloudPlaybackRecovery.runSegmentAware(
+            primary: .local,
+            preferredFallback: .apple,
+            fallbackEnabled: true,
+            configuredProviders: [.local, .apple],
+            segmentCount: 1,
+            onFallback: { _ in },
+            speak: { provider, _ in
+                if provider == .local { throw LocalTTSError.unexpectedModel }
+            }
+        )
+
+        #expect(usedProvider == .apple)
+    }
 
     @Test func backlogDocumentRoundTripsPendingCompletedAndMultilineEntries() throws {
         let pending = BacklogEntry(
@@ -375,7 +458,7 @@ struct VoiceInkTests {
         #expect(Date().timeIntervalSince(start) < 0.5)
     }
 
-    @Test func appTargetUsesMarketingVersion16() throws {
+    @Test func appTargetUsesMarketingVersion17() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -384,8 +467,8 @@ struct VoiceInkTests {
             encoding: .utf8
         )
 
-        #expect(project.components(separatedBy: "MARKETING_VERSION = 1.6;").count - 1 == 2)
-        #expect(AppVersionDisplay.text(version: "1.6") == "Version 1.6")
+        #expect(project.components(separatedBy: "MARKETING_VERSION = 1.7;").count - 1 == 2)
+        #expect(AppVersionDisplay.text(version: "1.7") == "Version 1.7")
     }
 
     @Test func geminiRetriesTransientInternalErrorAndReturnsAudio() async throws {
@@ -479,6 +562,7 @@ struct VoiceInkTests {
         )
     }
 
+    @MainActor
     @Test func fiveSecondSeekMovesExactlyFiveSecondsAndClampsToAudioBounds() {
         #expect(ReadAloudManager.seekStep == 5)
         #expect(PlaybackSeekTarget.seconds(current: 12, duration: 30, delta: -5) == 7)

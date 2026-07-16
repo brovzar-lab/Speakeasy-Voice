@@ -7,6 +7,7 @@ import SwiftUI
 struct ReadAloudSettingsView: View {
     @ObservedObject private var settings = ReadAloudSettings.shared
     @ObservedObject private var manager = ReadAloudManager.shared
+    @ObservedObject private var localModel = LocalTTSModelManager.shared
 
     @State private var voiceCatalog: AppleVoiceCatalog = .load()
     @State private var elevenLabsAPIKey: String = APIKeyManager.shared.getAPIKey(forProvider: "elevenlabs") ?? ""
@@ -69,12 +70,14 @@ struct ReadAloudSettingsView: View {
             } header: {
                 Text("Playback")
             } footer: {
-                Text("By default, selecting new text interrupts the current reading. Turn on Queue New Selections to play selections in order instead. If a cloud provider fails, Speakeasy retries and can continue with the backup provider.")
+                Text("By default, selecting new text interrupts the current reading. Turn on Queue New Selections to play selections in order instead. Automatic Backup uses your chosen provider first, then only free local voices. Paid cloud requests are never invented automatically.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             switch settings.provider {
+            case .local:
+                localSection
             case .apple:
                 appleSection
             case .elevenlabs:
@@ -127,6 +130,55 @@ struct ReadAloudSettingsView: View {
         .onChange(of: settings.provider) { _, _ in
             voiceSearch = ""
             reconcileFallbackProvider()
+        }
+    }
+
+    // MARK: - Local HD
+
+    private var localSection: some View {
+        Section {
+            Picker("Voice", selection: $settings.localVoice) {
+                ForEach(LocalKokoroVoices.all) { voice in
+                    Text(voice.displayName).tag(voice.id)
+                }
+            }
+            .pickerStyle(.menu)
+
+            LabeledContent("Model") {
+                switch localModel.state {
+                case .notDownloaded:
+                    Button(localModel.isInstalled ? "Load Local Voice" : "Download Local Voice (~360 MB)") {
+                        Task { _ = try? await localModel.prepare() }
+                    }
+                case .downloading:
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Downloading and preparing…")
+                            .foregroundStyle(.secondary)
+                    }
+                case .ready:
+                    HStack(spacing: 10) {
+                        Label("Ready", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Button("Free Memory") { localModel.unload() }
+                    }
+                case .failed(let message):
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                        Button("Try Again") {
+                            Task { _ = try? await localModel.prepare() }
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("Local HD")
+        } footer: {
+            Text("Kokoro runs entirely on this Mac after a one-time download. It is free, private, and supports English and Spanish. The model stays warm so later reads start quickly.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -365,8 +417,8 @@ struct ReadAloudSettingsView: View {
 
     private func reconcileFallbackProvider() {
         guard settings.fallbackProvider == settings.provider else { return }
-        let cloudOrder: [ReadAloudProvider] = [.elevenlabs, .openai, .gemini]
-        settings.fallbackProvider = cloudOrder.first { $0 != settings.provider } ?? .elevenlabs
+        let stabilityOrder: [ReadAloudProvider] = [.local, .apple, .openai, .elevenlabs, .gemini]
+        settings.fallbackProvider = stabilityOrder.first { $0 != settings.provider } ?? .apple
     }
 
     private var filteredGeminiVoices: [GeminiTTSVoices.Voice] {

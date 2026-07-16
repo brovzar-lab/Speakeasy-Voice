@@ -1,106 +1,108 @@
 # HANDOFF: Speakeasy-Voice
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Current state
 
-Speakeasy-Voice **1.6** is built, installed at `~/Downloads/Speakeasy-Voice.app`, and the completed feature work is on `main` at `b947ab7`. The repository was clean and synchronized with `origin/main` before this documentation update.
-
-Dictation is working well. The latest work focused on making cloud Read Aloud reliable and fast for long selections, adding practical playback controls, and letting Billy capture future changes inside the app.
+Speakeasy-Voice **1.7** is built and installed at `~/Downloads/Speakeasy-Voice.app`. Dictation remains working well. Read Aloud now defaults to a free, on-device Kokoro voice, protects paid providers with a hard monthly limit, and uses a corrected audio graph that fixes the Gemini crash reported in version 1.6.
 
 ## What shipped
 
-### 1. Reliable and faster Read Aloud
+### 1. Gemini crash fix
 
-- Gemini and ElevenLabs PCM streaming uses `AsyncStream<Data>` chunks off the MainActor. Never return to byte-at-a-time MainActor streaming; that was the macOS 26 crash root cause.
-- Gemini transient `INTERNAL` failures retry within a bounded request budget and can fall back to ElevenLabs when configured.
-- Provider error JSON is converted to a user-facing message instead of being shown raw.
-- Gemini 3.1 Flash streaming is the Gemini default. ElevenLabs Flash v2.5 streaming is the fastest recommended cloud path. Apple remains the most stable local baseline.
+- The July 15 crash report points to `AVAudioEngine.connect` inside `CloudTTSPlayer.setupPCMEngine`.
+- Gemini and ElevenLabs supply signed 16-bit PCM. The old graph connected that wire format directly to `AVAudioUnitVarispeed`, which can throw `kAudioUnitErr_FormatNotSupported` and crash AVFAudio.
+- `CloudPCMPlaybackFormat` now converts PCM16 little-endian samples to mono, deinterleaved Float32 before scheduling them.
+- The source edge uses Float32 and the main mixer negotiates the hardware-side format. Do not reconnect Int16 directly or force the mixer edge back to the network sample format.
+- Streaming still uses coarse `AsyncStream<Data>` chunks off the MainActor. Never return to byte-at-a-time MainActor work.
 
-### 2. Continuous long-text playback
+### 2. Free Local HD Read Aloud
 
-- `ReadAloudSegmentPlanner` splits long selections at paragraph/sentence boundaries into roughly 400–750 character sections, targeting 600 characters.
-- `CloudTTSRollingPipeline` prepares the current section and at most two future sections while audio is playing.
-- PCM sections share one continuous playback session. MP3 sections are supplied to one ordered chunk player.
-- The user should not hear paragraph-by-paragraph stops under normal network conditions. A `.buffering` state is shown if the next section is not ready.
-- Failure recovery begins at the first unheard section. It must never replay a section whose audio already started.
-- Usage tracking records one logical read, even when that read required several provider requests.
+- New provider: **Local HD (Free)** using `mlx-community/Kokoro-82M-bf16` through pinned `mlx-audio-swift` version `0.1.3`.
+- One-time model download is about 360 MB. It runs on Apple Silicon with MLX/Metal, supports English and Spanish, and stays warm between reads.
+- The model prepares both English and Spanish processors on load. Generation runs off the MainActor.
+- Long text still uses the 400–750 character segment planner, but all generated Float32 samples feed one continuous audio session so there are no deliberate paragraph stops.
+- Local HD is the new default. Existing installs migrate once with `readAloud.migratedLocalKokoroDefault_v1`.
+- Automatic Backup uses only the explicitly chosen backup plus Local HD and Apple. It never invents a different paid provider. If Local HD cannot load, Apple is the final free fallback.
+- Local benchmarks on this Mac: Kokoro warm English time-to-first-audio was about 0.74 seconds and generated a 9.12-second sample at about 12.3x realtime using roughly 312 MB. Qwen3-TTS was slower and used roughly 2.5 GB, so it was not integrated.
 
-### 3. Better selection and player behavior
+Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 
-- Selecting new text interrupts and replaces the current reading by default.
-- **Queue New Selections** in Read Aloud settings is now opt-in. Migration key: `readAloud.migratedInterruptOnNewSelection_v1`.
-- Rapid selection shortcuts cancel older capture tasks, so the newest selection wins.
-- The 420-pixel floating player includes rewind 5 seconds, pause/resume, forward 5 seconds, next queued selection, stop, and speed controls.
-- Downloaded MP3 audio seeks exactly five seconds. Apple speech and live cloud PCM approximate the position from spoken text and may rerender the remaining cloud text.
+### 3. Paid cloud spending guard
 
-### 4. In-app feature backlog
+- Read Aloud has a monthly hard limit, enabled by default at **$5**.
+- Before any ElevenLabs, OpenAI, or Gemini request, the app estimates the remaining selection cost and blocks the request if it would cross the limit.
+- Setting the limit to `$0` blocks every paid cloud voice. Local HD and Apple always remain usable.
+- The setting lives in **Read Aloud → Usage & Budget** and can be turned off explicitly.
+- The usage display includes Local HD at zero cost and changes color at 50%, 80%, and 100% of budget.
+- Cost is estimated from the app's pricing table, not reconciled against provider invoices. Update both `estimatedCostUSD` and `pricingReference` when pricing changes.
 
-- Settings now includes **Feature Backlog**, where Billy can write a change in plain language.
-- Entries are stored in repository-root `BACKLOG.md` by default. The UI can edit, complete, delete, open, or switch the file.
-- Writes are atomic, external file changes are reloaded before mutations, and every item preserves a UUID plus added/completed dates.
-- Saying **“execute backlog”** means implement every pending item in the safest logical order, test each independently, then mark it complete. Do not ask Billy to choose entries one by one unless work is destructive, irreversible, spends money, conflicts, or is genuinely blocked.
-- Current backlog: **0 pending, 3 completed**.
+### 4. Existing long-text and selection behavior
 
-### 5. Version and build identity
+- `ReadAloudSegmentPlanner` splits long selections at paragraph/sentence boundaries into roughly 400–750 character sections, targeting 600.
+- `CloudTTSRollingPipeline` prepares the current section and at most two future sections.
+- PCM sections share one continuous playback session. MP3 sections remain ordered.
+- Recovery begins at the first unheard section and never replays a section whose audio already started.
+- Selecting new text interrupts the current reading by default. **Queue New Selections** is opt-in.
+- The floating player supports ±5-second seek, pause/resume, next queued selection, stop, and speed control.
 
-- User-visible version: **1.6**.
-- App target: `MARKETING_VERSION = 1.6`, build `201`.
-- User-visible product name: `Speakeasy-Voice`.
+### 5. In-app feature backlog
+
+- Settings includes **Feature Backlog**, stored in repository-root `BACKLOG.md` by default.
+- Billy can add, edit, complete, delete, open, or switch the file.
+- “Execute backlog” means process every pending item in the safest logical order without asking for one-by-one selection.
+
+### 6. Version and build
+
+- User-visible version: **1.7**.
+- App target: `MARKETING_VERSION = 1.7`, build `202`.
 - Keep bundle id, Swift module, UserDefaults keys, and internal `VoiceInk` names unchanged.
-- Local builds use the stable self-signed `Speakeasy-Voice Local` identity so Accessibility and Input Monitoring permissions survive rebuilds.
+- Local builds use the stable self-signed `Speakeasy-Voice Local` identity.
+- `make test` runs the deterministic signed unit suite. `make test-ui` is separate because macOS can time out while enabling UI automation before any test starts.
 
-## Proof from the last implementation pass
+## Proof from this implementation pass
 
-- Feature commits on `main`:
-  - `2b0cba7` Add in-app feature backlog
-  - `10dc0b8` Stream long cloud read-aloud selections
-  - `b947ab7` Complete read-aloud playback backlog
-- **46 unit tests passed**, including backlog persistence, rolling order/prefetch/recovery, Gemini retry/fallback, interrupt-versus-queue behavior, five-second seek, usage aggregation, and version 1.6.
-- The full UI run passed **7 of 8** cases. The autogenerated `VoiceInkUITestsLaunchTests.testLaunch` timed out while activating the background menu-bar app; the other launch variants and the signed manual launch passed. Treat this as a UI-test harness issue, not proof of an app crash.
-- `make local` succeeded and the signed 1.6 app launched from `~/Downloads/Speakeasy-Voice.app`.
-- Visual proof:
-  - `~/Downloads/Speakeasy-Voice-1.6-Window-Proof.png`
-  - `~/Downloads/Speakeasy-Voice-1.6-Player-Controls-Proof.png`
+- `make local` completed with `** BUILD SUCCEEDED **` and copied version 1.7 to `~/Downloads/Speakeasy-Voice.app`.
+- **52 unit tests passed**, including PCM format/conversion, Gemini recovery, free-provider fallback, local-to-Apple fallback, hard-budget blocking, long-text continuity, backlog, and version 1.7.
+- The exact Float32 audio-engine graph starts successfully in a standalone AVFoundation proof.
+- The installed bundle contains `default.metallib`, reports version 1.7, and remained running after relaunch.
+- The optional UI runner timed out while macOS was enabling automation mode, before a UI test began. This is kept separate as `make test-ui`.
+
+## Stability order
+
+1. **Local HD**: recommended default, free and on-device after download.
+2. **Apple**: most dependable emergency fallback, free, but lower voice quality.
+3. **OpenAI `tts-1`**: stable paid batch API, slower startup for long text.
+4. **ElevenLabs Flash v2.5**: fastest high-quality paid streaming option.
+5. **Gemini 3.1 Flash preview**: improved by the crash fix and retries, but still the least predictable because the provider can return `INTERNAL` errors or truncate long generations.
 
 ## Known risks and guardrails
 
-1. Google can truncate a single Gemini SSE request around 60 seconds with `finishReason: OTHER`. The rolling segment pipeline is the workaround; keep it enabled.
-2. Never schedule streaming PCM byte-by-byte on the MainActor. Decode chunks off actor and schedule buffers on the MainActor.
-3. Never replay already-heard content during provider recovery.
-4. `APIKeyManager` must keep trimming whitespace on both save and load.
-5. OpenAI `tts-1` and `tts-1-hd` accept only the nine base voices. The extended voices require `gpt-4o-mini-tts`.
-6. Existing compiler warning: `ReadAloudUsageTracker.swift:46` uses a main-actor-isolated `.shared` value as a default argument. This may become an error under Swift 6 and should be cleaned up in a future maintenance pass.
-7. `README.md` still describes the upstream VoiceInk project. It needs a separate public-facing Speakeasy rewrite; it was intentionally not mixed into this internal state update.
-
-## Next action
-
-There is no pending backlog work. For the next session:
-
-1. Read `AGENTS.md` or `CLAUDE.md` for durable project rules.
-2. Read `BACKLOG.md`.
-3. If it contains pending entries and Billy says “execute backlog,” prioritize and complete all of them automatically.
-4. For any Swift change, run tests, then `make local`, relaunch the signed app, and show proof before claiming success.
+1. Google can truncate a single Gemini SSE request around 60 seconds with `finishReason: OTHER`. Keep the rolling segment pipeline.
+2. Never schedule streaming PCM byte-by-byte on the MainActor.
+3. Never replay already-heard content during recovery.
+4. `APIKeyManager` must trim whitespace on save and load.
+5. OpenAI `tts-1` and `tts-1-hd` accept only the nine base voices.
+6. Local HD needs network access for its first model download. After it is cached, synthesis is local.
+7. `README.md` still describes upstream VoiceInk and needs a separate public-facing rewrite.
 
 ## Key files
 
-- `AGENTS.md` and `CLAUDE.md`: durable agent instructions and architecture
-- `BACKLOG.md`: user-authored feature queue
-- `VoiceInk/Backlog/`: backlog parser and store
-- `VoiceInk/ReadAloud/ReadAloudManager.swift`: orchestration and selection behavior
+- `VoiceInk/ReadAloud/LocalTTSProvider.swift`: Kokoro model lifecycle and local synthesis
+- `VoiceInk/ReadAloud/CloudTTSProvider.swift`: cloud APIs, PCM conversion, shared audio player
+- `VoiceInk/ReadAloud/ReadAloudManager.swift`: orchestration and preflight budget check
+- `VoiceInk/ReadAloud/ReadAloudSettings.swift`: providers, migration, fallback policy
+- `VoiceInk/ReadAloud/ReadAloudUsageTracker.swift`: usage, estimates, hard-limit policy
 - `VoiceInk/ReadAloud/ReadAloudSegmentPlanner.swift`: long-text boundaries
-- `VoiceInk/ReadAloud/CloudTTSRollingPipeline.swift`: rolling prefetch/recovery
-- `VoiceInk/ReadAloud/CloudTTSProvider.swift`: provider APIs and cloud playback
-- `VoiceInk/ReadAloud/ReadAloudIndicatorWindow.swift`: floating player controls
-- `VoiceInk/Views/Settings/ReadAloudSettingsView.swift`: provider and queue settings
-- `VoiceInk/Views/Settings/FeatureBacklogSettingsSection.swift`: backlog UI
-- `VoiceInkTests/VoiceInkTests.swift`: focused regression suite
+- `VoiceInk/Views/Settings/ReadAloudSettingsView.swift`: provider/model settings
+- `VoiceInkTests/VoiceInkTests.swift`: regression suite
+- `docs/research/2026-07-15-local-tts-options.md`: model research and benchmark evidence
 
 ## Run and verify
 
 ```bash
 cd ~/CODE/SPEAKEASY-VOICE
-xcodebuild test -project VoiceInk.xcodeproj -scheme VoiceInk -destination 'platform=macOS'
+make test
 make local
 open ~/Downloads/Speakeasy-Voice.app
 ```

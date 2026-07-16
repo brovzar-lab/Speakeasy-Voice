@@ -60,6 +60,17 @@ final class ReadAloudManager: ObservableObject {
         return p
     }()
 
+    private lazy var localProvider: LocalKokoroTTSProvider = {
+        let p = LocalKokoroTTSProvider(modelManager: .shared)
+        p.onProgressUpdate = { [weak self] value in
+            Task { @MainActor in self?.setProgress(value) }
+        }
+        p.onBufferingUpdate = { [weak self] value in
+            Task { @MainActor in self?.setBuffering(value) }
+        }
+        return p
+    }()
+
     private lazy var elevenLabsProvider: ElevenLabsTTSProvider = {
         let p = ElevenLabsTTSProvider()
         p.onProgressUpdate = { [weak self] value in
@@ -540,8 +551,27 @@ final class ReadAloudManager: ObservableObject {
                     },
                     speak: { kind, startingSegment in
                         let selectedProvider = self.provider(for: kind)
+                        let remainingText = segmentPlan.text(fromSegment: startingSegment)
+                        let model = settings.modelIdentifier(for: kind)
+                        switch PaidTTSBudgetPolicy.decision(
+                            provider: kind,
+                            model: model,
+                            characterCount: remainingText.count,
+                            currentMonthlySpend: ReadAloudUsageTracker.shared.costThisMonth,
+                            monthlyBudget: ReadAloudUsageTracker.shared.monthlyBudgetUSD,
+                            hardLimitEnabled: ReadAloudUsageTracker.shared.hardLimitEnabled
+                        ) {
+                        case .allowed:
+                            break
+                        case .blocked(let estimatedRequestCost, let remainingBudget):
+                            throw PaidTTSBudgetError(
+                                provider: kind,
+                                estimatedRequestCost: estimatedRequestCost,
+                                remainingBudget: remainingBudget
+                            )
+                        }
                         try await selectedProvider.speak(
-                            segmentPlan.text(fromSegment: startingSegment),
+                            remainingText,
                             voice: settings.makeVoiceConfiguration(for: kind)
                         )
                     }
@@ -586,6 +616,7 @@ final class ReadAloudManager: ObservableObject {
 
     private func provider(for kind: ReadAloudProvider) -> TextToSpeechProvider {
         switch kind {
+        case .local: return localProvider
         case .apple: return appleProvider
         case .elevenlabs: return elevenLabsProvider
         case .openai: return openAIProvider
@@ -594,11 +625,10 @@ final class ReadAloudManager: ObservableObject {
     }
 
     private func configuredProviders() -> Set<ReadAloudProvider> {
-        var providers = Set<ReadAloudProvider>()
+        var providers: Set<ReadAloudProvider> = [.local, .apple]
         if APIKeyManager.shared.hasAPIKey(forProvider: "elevenlabs") { providers.insert(.elevenlabs) }
         if APIKeyManager.shared.hasAPIKey(forProvider: "openai") { providers.insert(.openai) }
         if APIKeyManager.shared.hasAPIKey(forProvider: "gemini") { providers.insert(.gemini) }
-        if ReadAloudSettings.shared.fallbackProvider == .apple { providers.insert(.apple) }
         return providers
     }
 }
@@ -606,7 +636,7 @@ final class ReadAloudManager: ObservableObject {
 private extension Float {
     /// Snap to N decimal places so repeated +/- 0.1 doesn't drift into 1.0999999.
     func rounded(toDecimalPlaces places: Int) -> Float {
-        let factor = pow(10.0, Float(places))
+        let factor = Float(Foundation.pow(10.0, Double(places)))
         return (self * factor).rounded() / factor
     }
 }

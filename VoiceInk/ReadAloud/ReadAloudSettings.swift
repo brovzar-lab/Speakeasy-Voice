@@ -3,6 +3,7 @@ import Combine
 
 /// Which TTS provider handles read-aloud playback.
 enum ReadAloudProvider: String, CaseIterable, Identifiable {
+    case local
     case apple
     case elevenlabs
     case openai
@@ -12,6 +13,7 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
+        case .local:      return String(localized: "Local HD (Free)")
         case .apple:      return String(localized: "Apple (Local)")
         case .elevenlabs: return String(localized: "ElevenLabs")
         case .openai:     return String(localized: "OpenAI TTS")
@@ -21,10 +23,18 @@ enum ReadAloudProvider: String, CaseIterable, Identifiable {
 
     var shortName: String {
         switch self {
+        case .local: return "Local HD"
         case .apple: return "Apple"
         case .elevenlabs: return "ElevenLabs"
         case .openai: return "OpenAI"
         case .gemini: return "Gemini"
+        }
+    }
+
+    var isMetered: Bool {
+        switch self {
+        case .local, .apple: return false
+        case .elevenlabs, .openai, .gemini: return true
         }
     }
 }
@@ -57,7 +67,10 @@ enum ReadAloudFallbackPolicy {
     ) -> ReadAloudProvider? {
         guard isEnabled, error.isTransient, isSafeToRestart(after: error) else { return nil }
 
-        var candidates = [preferred, .elevenlabs, .openai]
+        // Only the explicitly selected backup may be metered. Any additional
+        // automatic choices stay local so a provider outage cannot create an
+        // unexpected bill on a different cloud account.
+        var candidates = [preferred, .local, .apple]
         var seen = Set<ReadAloudProvider>()
         candidates = candidates.filter { seen.insert($0).inserted }
         return candidates.first { $0 != primary && configuredProviders.contains($0) }
@@ -143,6 +156,26 @@ enum ReadAloudPlaybackRecovery {
             onFallback(fallback)
             try await speak(fallback, 0)
             return fallback
+        } catch let error as PaidTTSBudgetError {
+            guard fallbackEnabled,
+                  let fallback = [ReadAloudProvider.local, .apple]
+                    .first(where: { $0 != primary && configuredProviders.contains($0) }) else {
+                throw error
+            }
+            try Task.checkCancellation()
+            onFallback(fallback)
+            try await speak(fallback, 0)
+            return fallback
+        } catch let error as LocalTTSError {
+            guard fallbackEnabled,
+                  primary == .local,
+                  configuredProviders.contains(.apple) else {
+                throw error
+            }
+            try Task.checkCancellation()
+            onFallback(.apple)
+            try await speak(.apple, 0)
+            return .apple
         }
     }
 
@@ -155,7 +188,7 @@ enum ReadAloudPlaybackRecovery {
     ) -> ReadAloudProvider? {
         guard isEnabled, error.isTransient || error == .streamEndedEarly else { return nil }
         var seen = Set<ReadAloudProvider>()
-        return [preferred, .elevenlabs, .openai]
+        return [preferred, .local, .apple]
             .filter { seen.insert($0).inserted }
             .first { $0 != primary && configuredProviders.contains($0) }
     }
@@ -164,6 +197,11 @@ enum ReadAloudPlaybackRecovery {
 enum ReadAloudErrorPresentation {
     static func message(provider: ReadAloudProvider, error: Error) -> String {
         guard let cloudError = error as? CloudTTSError else {
+            if let localized = error as? LocalizedError,
+               let description = localized.errorDescription,
+               !description.isEmpty {
+                return description
+            }
             return "\(provider.shortName) could not read this selection. Please try again."
         }
 
@@ -212,6 +250,7 @@ final class ReadAloudSettings: ObservableObject {
 
     private enum Keys {
         static let provider = "readAloud.provider"
+        static let localVoice = "readAloud.localVoice"
         static let appleVoiceIdentifier = "readAloud.appleVoiceIdentifier"
         static let elevenLabsVoiceId = "readAloud.elevenLabsVoiceId"
         static let elevenLabsModelId = "readAloud.elevenLabsModelId"
@@ -225,10 +264,16 @@ final class ReadAloudSettings: ObservableObject {
         static let fallbackProvider = "readAloud.fallbackProvider"
         static let enqueueSelectedText = "readAloud.enqueueSelectedText"
         static let migratedInterruptOnNewSelection = "readAloud.migratedInterruptOnNewSelection_v1"
+        static let migratedLocalDefault = "readAloud.migratedLocalKokoroDefault_v1"
+        static let migratedLocalFallback = "readAloud.migratedLocalKokoroFallback_v1"
     }
 
     @Published var provider: ReadAloudProvider {
         didSet { UserDefaults.standard.set(provider.rawValue, forKey: Keys.provider) }
+    }
+
+    @Published var localVoice: String {
+        didSet { UserDefaults.standard.set(localVoice, forKey: Keys.localVoice) }
     }
 
     @Published var appleVoiceIdentifier: String? {
@@ -289,7 +334,12 @@ final class ReadAloudSettings: ObservableObject {
 
     private init() {
         let defaults = UserDefaults.standard
-        self.provider = ReadAloudProvider(rawValue: defaults.string(forKey: Keys.provider) ?? "") ?? .apple
+        if !defaults.bool(forKey: Keys.migratedLocalDefault) {
+            defaults.set(ReadAloudProvider.local.rawValue, forKey: Keys.provider)
+            defaults.set(true, forKey: Keys.migratedLocalDefault)
+        }
+        self.provider = ReadAloudProvider(rawValue: defaults.string(forKey: Keys.provider) ?? "") ?? .local
+        self.localVoice = defaults.string(forKey: Keys.localVoice) ?? "am_michael"
         self.appleVoiceIdentifier = defaults.string(forKey: Keys.appleVoiceIdentifier)
         self.elevenLabsVoiceId = defaults.string(forKey: Keys.elevenLabsVoiceId) ?? "21m00Tcm4TlvDq8ikWAM" // "Rachel" default
         // Flash v2.5 is the recommended default: ~75ms latency (~3-4x faster than Turbo),
@@ -318,9 +368,13 @@ final class ReadAloudSettings: ObservableObject {
         let storedPitch = defaults.object(forKey: Keys.pitch) as? Float
         self.pitch = storedPitch ?? 1.0
         self.automaticFallbackEnabled = defaults.bool(forKey: Keys.automaticFallbackEnabled)
+        if !defaults.bool(forKey: Keys.migratedLocalFallback) {
+            defaults.set(ReadAloudProvider.local.rawValue, forKey: Keys.fallbackProvider)
+            defaults.set(true, forKey: Keys.migratedLocalFallback)
+        }
         self.fallbackProvider = ReadAloudProvider(
             rawValue: defaults.string(forKey: Keys.fallbackProvider) ?? ""
-        ) ?? .elevenlabs
+        ) ?? .local
         if !defaults.bool(forKey: Keys.migratedInterruptOnNewSelection) {
             defaults.set(false, forKey: Keys.enqueueSelectedText)
             defaults.set(true, forKey: Keys.migratedInterruptOnNewSelection)
@@ -335,6 +389,14 @@ final class ReadAloudSettings: ObservableObject {
 
     func makeVoiceConfiguration(for provider: ReadAloudProvider) -> VoiceConfiguration {
         switch provider {
+        case .local:
+            return VoiceConfiguration(
+                voiceIdentifier: localVoice,
+                rate: rate,
+                pitch: 1.0,
+                volume: 1.0,
+                languageCode: LocalKokoroVoices.languageCode(for: localVoice)
+            )
         case .apple:
             return VoiceConfiguration(
                 voiceIdentifier: appleVoiceIdentifier,
@@ -373,5 +435,42 @@ final class ReadAloudSettings: ObservableObject {
     /// Whether the selected Gemini model supports `streamGenerateContent` audio.
     var geminiSupportsStreaming: Bool {
         geminiModel.contains("3.1")
+    }
+
+    func modelIdentifier(for provider: ReadAloudProvider) -> String {
+        switch provider {
+        case .local: return LocalTTSModelManager.modelRepository
+        case .apple: return "system"
+        case .elevenlabs: return elevenLabsModelId
+        case .openai: return openAIModel
+        case .gemini: return geminiModel
+        }
+    }
+}
+
+enum LocalKokoroVoices {
+    struct Voice: Identifiable, Hashable {
+        let id: String
+        let displayName: String
+    }
+
+    static let all: [Voice] = [
+        Voice(id: "am_michael", displayName: "Michael (US English)"),
+        Voice(id: "am_adam", displayName: "Adam (US English)"),
+        Voice(id: "af_heart", displayName: "Heart (US English)"),
+        Voice(id: "af_bella", displayName: "Bella (US English)"),
+        Voice(id: "bm_george", displayName: "George (UK English)"),
+        Voice(id: "bf_emma", displayName: "Emma (UK English)"),
+        Voice(id: "ef_dora", displayName: "Dora (Spanish)"),
+        Voice(id: "em_alex", displayName: "Alex (Spanish)"),
+        Voice(id: "em_santa", displayName: "Santa (Spanish)")
+    ]
+
+    static func languageCode(for voice: String) -> String {
+        switch voice.first {
+        case "e": return "es"
+        case "b": return "en-gb"
+        default: return "en-us"
+        }
     }
 }

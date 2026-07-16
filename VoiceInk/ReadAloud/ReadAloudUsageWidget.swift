@@ -259,6 +259,15 @@ struct ReadAloudUsageWidget: View {
                 }
                 .frame(height: 8)
             }
+
+            Toggle("Block paid cloud voices at this limit", isOn: $usage.hardLimitEnabled)
+                .font(.system(size: 12, weight: .medium))
+
+            Text(usage.monthlyBudgetUSD == 0
+                 ? "The $0 limit blocks every paid cloud request. Local HD and Apple always remain available."
+                 : "Speakeasy estimates each request before sending it and blocks any paid read that would cross this limit.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -297,6 +306,7 @@ struct ReadAloudUsageWidget: View {
 
     private func providerDisplayName(_ provider: String) -> String {
         switch provider {
+        case "local": return String(localized: "Local HD")
         case "apple": return String(localized: "Apple")
         case "elevenlabs": return String(localized: "ElevenLabs")
         case "openai": return String(localized: "OpenAI")
@@ -307,6 +317,7 @@ struct ReadAloudUsageWidget: View {
 
     private func providerColor(_ provider: String) -> Color {
         switch provider {
+        case "local": return Color(red: 0.55, green: 0.38, blue: 0.82)
         case "elevenlabs": return Color(red: 0.36, green: 0.58, blue: 0.85)
         case "openai": return Color(red: 0.30, green: 0.72, blue: 0.55)
         case "gemini": return Color(red: 0.26, green: 0.52, blue: 0.96)
@@ -318,6 +329,7 @@ struct ReadAloudUsageWidget: View {
     private func budgetBarColor(progress: Double) -> Color {
         if progress >= 1.0 { return .red }
         if progress >= 0.8 { return .orange }
+        if progress >= 0.5 { return .yellow }
         return .accentColor
     }
 }
