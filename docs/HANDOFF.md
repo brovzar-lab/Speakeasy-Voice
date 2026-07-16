@@ -4,11 +4,19 @@ Last updated: 2026-07-16
 
 ## Current state
 
-Speakeasy-Voice **1.7 build 204** is built and installed at `~/Downloads/Speakeasy-Voice.app`. Dictation remains working well. Read Aloud defaults to a free, on-device Kokoro voice, protects paid providers with a hard monthly limit, and uses a direct Float32 audio graph that fixes both the Gemini crash and silent Local HD playback.
+Speakeasy-Voice **1.7 build 205** fixes the silent termination that occurred when Local HD failed and recovery switched to Apple. Dictation remains working well. Read Aloud defaults to a free, on-device Kokoro voice, protects paid providers with a hard monthly limit, and uses a direct Float32 audio graph that fixes both the Gemini crash and silent Local HD playback.
 
 ## What shipped
 
-### 1. Gemini and silent Local HD playback fix
+### 1. Silent fallback termination fix
+
+- Two July 16 crash reports showed AppKit aborting with `NSWindow should only be instantiated on the main thread!`.
+- Local HD failure correctly selected Apple as the free backup, but the recovery callback created its notification `NSPanel` from a cooperative background thread.
+- `ReadAloudPlaybackRecovery` now requires its fallback callback to run on `@MainActor` for every cloud, budget, partial-stream, and Local HD recovery path.
+- Fallback logging now includes the underlying provider error so the reason Local HD failed is visible without another crash.
+- A regression invokes Local HD recovery from a detached task and proves the UI callback returns to the main thread.
+
+### 2. Gemini and silent Local HD playback fix
 
 - The July 15 crash report points to `AVAudioEngine.connect` inside `CloudTTSPlayer.setupPCMEngine`.
 - Gemini and ElevenLabs supply signed 16-bit PCM. The old graph connected that wire format directly to `AVAudioUnitVarispeed`, which can throw `kAudioUnitErr_FormatNotSupported` and crash AVFAudio.
@@ -17,7 +25,7 @@ Speakeasy-Voice **1.7 build 204** is built and installed at `~/Downloads/Speakea
 - PCM speed is applied with pitch-preserving WSOLA time stretching before scheduling, and that work runs off the MainActor. This lets Local HD, Gemini, and ElevenLabs streaming voices speak faster without the chipmunk pitch shift. Do not restore the streaming effect unit, simple resampling, Int16 graph connections, or a forced network sample format at the mixer edge.
 - Streaming still uses coarse `AsyncStream<Data>` chunks off the MainActor. Never return to byte-at-a-time MainActor work.
 
-### 2. Free Local HD Read Aloud
+### 3. Free Local HD Read Aloud
 
 - New provider: **Local HD (Free)** using `mlx-community/Kokoro-82M-bf16` through pinned `mlx-audio-swift` version `0.1.3`.
 - One-time model download is about 360 MB. It runs on Apple Silicon with MLX/Metal, supports English and Spanish, and stays warm between reads.
@@ -29,7 +37,7 @@ Speakeasy-Voice **1.7 build 204** is built and installed at `~/Downloads/Speakea
 
 Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 
-### 3. Paid cloud spending guard
+### 4. Paid cloud spending guard
 
 - Read Aloud has a monthly hard limit, enabled by default at **$5**.
 - Before any ElevenLabs, OpenAI, or Gemini request, the app estimates the remaining selection cost and blocks the request if it would cross the limit.
@@ -38,7 +46,7 @@ Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 - The usage display includes Local HD at zero cost and changes color at 50%, 80%, and 100% of budget.
 - Cost is estimated from the app's pricing table, not reconciled against provider invoices. Update both `estimatedCostUSD` and `pricingReference` when pricing changes.
 
-### 4. Existing long-text and selection behavior
+### 5. Existing long-text and selection behavior
 
 - `ReadAloudSegmentPlanner` splits long selections at paragraph/sentence boundaries into roughly 400–750 character sections, targeting 600.
 - `CloudTTSRollingPipeline` prepares the current section and at most two future sections.
@@ -47,16 +55,16 @@ Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 - Selecting new text interrupts the current reading by default. **Queue New Selections** is opt-in.
 - The floating player supports ±5-second seek, pause/resume, next queued selection, stop, and speed control.
 
-### 5. In-app feature backlog
+### 6. In-app feature backlog
 
 - Settings includes **Feature Backlog**, stored in repository-root `BACKLOG.md` by default.
 - Billy can add, edit, complete, delete, open, or switch the file.
 - “Execute backlog” means process every pending item in the safest logical order without asking for one-by-one selection.
 
-### 6. Version and build
+### 7. Version and build
 
 - User-visible version: **1.7**.
-- App target: `MARKETING_VERSION = 1.7`, build `204`.
+- App target: `MARKETING_VERSION = 1.7`, build `205`.
 - Keep bundle id, Swift module, UserDefaults keys, and internal `VoiceInk` names unchanged.
 - Local builds use the stable self-signed `Speakeasy-Voice Local` identity.
 - `make test` runs the deterministic signed unit suite. `make test-ui` is separate because macOS can time out while enabling UI automation before any test starts.
@@ -64,7 +72,7 @@ Research and source links: `docs/research/2026-07-15-local-tts-options.md`.
 ## Proof from this implementation pass
 
 - `make local` completed with `** BUILD SUCCEEDED **` and copied version 1.7 to `~/Downloads/Speakeasy-Voice.app`.
-- **55 unit tests passed**, including a pitch regression proving 440 Hz remains 440 Hz at 1.25×, 1.5×, 1.75×, and 2×, real audio-engine duration/speed checks, PCM format/conversion, Gemini recovery, free-provider fallback, local-to-Apple fallback, hard-budget blocking, long-text continuity, backlog, and version 1.7.
+- **56 unit tests passed**, including the fallback-main-thread crash regression, a pitch regression proving 440 Hz remains 440 Hz at 1.25×, 1.5×, 1.75×, and 2×, real audio-engine duration/speed checks, PCM format/conversion, Gemini recovery, free-provider fallback, local-to-Apple fallback, hard-budget blocking, long-text continuity, backlog, and version 1.7 build 205.
 - The exact Float32 audio-engine graph starts successfully in a standalone AVFoundation proof.
 - The installed bundle contains `default.metallib`, reports version 1.7, and remained running after relaunch.
 - The optional UI runner timed out while macOS was enabling automation mode, before a UI test began. This is kept separate as `make test-ui`.

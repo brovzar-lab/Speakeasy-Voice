@@ -88,7 +88,7 @@ enum ReadAloudPlaybackRecovery {
         preferredFallback: ReadAloudProvider,
         fallbackEnabled: Bool,
         configuredProviders: Set<ReadAloudProvider>,
-        onFallback: (ReadAloudProvider) -> Void,
+        onFallback: @MainActor (ReadAloudProvider, Error) -> Void,
         speak: (ReadAloudProvider) async throws -> Void
     ) async throws -> ReadAloudProvider {
         do {
@@ -107,7 +107,7 @@ enum ReadAloudPlaybackRecovery {
                 throw error
             }
             try Task.checkCancellation()
-            onFallback(fallback)
+            await onFallback(fallback, error)
             try await speak(fallback)
             return fallback
         }
@@ -119,7 +119,7 @@ enum ReadAloudPlaybackRecovery {
         fallbackEnabled: Bool,
         configuredProviders: Set<ReadAloudProvider>,
         segmentCount: Int,
-        onFallback: (ReadAloudProvider) -> Void,
+        onFallback: @MainActor (ReadAloudProvider, Error) -> Void,
         speak: (ReadAloudProvider, Int) async throws -> Void
     ) async throws -> ReadAloudProvider {
         do {
@@ -139,7 +139,7 @@ enum ReadAloudPlaybackRecovery {
                 throw partial.underlying
             }
             try Task.checkCancellation()
-            onFallback(fallback)
+            await onFallback(fallback, partial.underlying)
             try await speak(fallback, partial.firstSafeFallbackIndex)
             return fallback
         } catch let error as CloudTTSError {
@@ -153,7 +153,7 @@ enum ReadAloudPlaybackRecovery {
                 throw error
             }
             try Task.checkCancellation()
-            onFallback(fallback)
+            await onFallback(fallback, error)
             try await speak(fallback, 0)
             return fallback
         } catch let error as PaidTTSBudgetError {
@@ -163,7 +163,7 @@ enum ReadAloudPlaybackRecovery {
                 throw error
             }
             try Task.checkCancellation()
-            onFallback(fallback)
+            await onFallback(fallback, error)
             try await speak(fallback, 0)
             return fallback
         } catch let error as LocalTTSError {
@@ -173,7 +173,7 @@ enum ReadAloudPlaybackRecovery {
                 throw error
             }
             try Task.checkCancellation()
-            onFallback(.apple)
+            await onFallback(.apple, error)
             try await speak(.apple, 0)
             return .apple
         }

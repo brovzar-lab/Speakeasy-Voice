@@ -10,6 +10,19 @@ import AVFoundation
 import Testing
 @testable import VoiceInk
 
+private final class ThreadSafeBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool {
+        lock.withLock { storedValue }
+    }
+
+    func set(_ value: Bool) {
+        lock.withLock { storedValue = value }
+    }
+}
+
 struct VoiceInkTests {
 
     @Test func cloudPCMPlaybackUsesMixerCompatibleFloat32Format() throws {
@@ -163,13 +176,35 @@ struct VoiceInkTests {
             fallbackEnabled: true,
             configuredProviders: [.local, .apple],
             segmentCount: 1,
-            onFallback: { _ in },
+            onFallback: { _, _ in },
             speak: { provider, _ in
                 if provider == .local { throw LocalTTSError.unexpectedModel }
             }
         )
 
         #expect(usedProvider == .apple)
+    }
+
+    @Test func localFallbackNotificationRunsOnTheMainThread() async throws {
+        let callbackRanOnMainThread = ThreadSafeBool()
+
+        _ = try await Task.detached {
+            try await ReadAloudPlaybackRecovery.runSegmentAware(
+                primary: .local,
+                preferredFallback: .apple,
+                fallbackEnabled: true,
+                configuredProviders: [.local, .apple],
+                segmentCount: 1,
+                onFallback: { _, _ in
+                    callbackRanOnMainThread.set(Thread.isMainThread)
+                },
+                speak: { provider, _ in
+                    if provider == .local { throw LocalTTSError.unexpectedModel }
+                }
+            )
+        }.value
+
+        #expect(callbackRanOnMainThread.value)
     }
 
     @Test func backlogDocumentRoundTripsPendingCompletedAndMultilineEntries() throws {
@@ -546,6 +581,7 @@ struct VoiceInkTests {
         )
 
         #expect(project.components(separatedBy: "MARKETING_VERSION = 1.7;").count - 1 == 2)
+        #expect(project.components(separatedBy: "CURRENT_PROJECT_VERSION = 205;").count - 1 == 2)
         #expect(AppVersionDisplay.text(version: "1.7") == "Version 1.7")
     }
 
@@ -749,7 +785,7 @@ struct VoiceInkTests {
             preferredFallback: .elevenlabs,
             fallbackEnabled: true,
             configuredProviders: [.elevenlabs],
-            onFallback: { _ in fallbackAttemptCount = geminiAttempts },
+            onFallback: { _, _ in fallbackAttemptCount = geminiAttempts },
             speak: { provider in
                 spokenProviders.append(provider)
                 if provider == .gemini {
@@ -779,7 +815,7 @@ struct VoiceInkTests {
                 preferredFallback: .elevenlabs,
                 fallbackEnabled: true,
                 configuredProviders: [.elevenlabs],
-                onFallback: { _ in fallbackCalls += 1 },
+                onFallback: { _, _ in fallbackCalls += 1 },
                 speak: { provider in
                     if provider == .elevenlabs { return }
                     let _: Data = try await CloudTTSRetryPolicy.run(
@@ -809,7 +845,7 @@ struct VoiceInkTests {
             fallbackEnabled: true,
             configuredProviders: [.elevenlabs],
             segmentCount: 4,
-            onFallback: { _ in },
+            onFallback: { _, _ in },
             speak: { provider, startingSegment in
                 providers.append(provider)
                 startingSegments.append(startingSegment)

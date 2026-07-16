@@ -541,9 +541,9 @@ final class ReadAloudManager: ObservableObject {
                     fallbackEnabled: settings.automaticFallbackEnabled,
                     configuredProviders: self.configuredProviders(),
                     segmentCount: segmentPlan.segments.count,
-                    onFallback: { fallbackKind in
+                    onFallback: { fallbackKind, underlyingError in
                         let fallbackProvider = self.provider(for: fallbackKind)
-                        self.logger.warning("Read-aloud primary failed; continuing with fallback primary=\(primaryKind.rawValue, privacy: .public) fallback=\(fallbackKind.rawValue, privacy: .public)")
+                        self.logger.warning("Read-aloud primary failed; continuing with fallback primary=\(primaryKind.rawValue, privacy: .public) fallback=\(fallbackKind.rawValue, privacy: .public) reason=\(underlyingError.localizedDescription, privacy: .public)")
                         self.showReadAloudMessage("\(primaryKind.shortName) is unavailable. Continuing with \(fallbackKind.shortName).")
                         self.activeProvider = fallbackKind
                         self.currentProviderRef = fallbackProvider
