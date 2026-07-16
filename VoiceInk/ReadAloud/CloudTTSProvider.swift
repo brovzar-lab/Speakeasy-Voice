@@ -496,10 +496,10 @@ enum PCMContinuousPlaybackCoordinator {
 
 // MARK: - Shared audio playback backing
 
-/// `AVAudioUnitVarispeed` and the main mixer require Apple's standard client
-/// format on current macOS releases: deinterleaved native Float32. Gemini and
-/// ElevenLabs send signed 16-bit little-endian PCM, so convert at this boundary
-/// instead of connecting that wire format directly to the audio graph.
+/// The main mixer requires Apple's standard client format on current macOS
+/// releases: deinterleaved native Float32. Gemini and ElevenLabs send signed
+/// 16-bit little-endian PCM, so convert at this boundary instead of connecting
+/// that wire format directly to the audio graph.
 enum CloudPCMPlaybackFormat {
     static func make(sampleRate: Double) -> AVAudioFormat? {
         guard sampleRate.isFinite, sampleRate > 0 else { return nil }
@@ -514,22 +514,56 @@ enum CloudPCMPlaybackFormat {
             return false
         }
 
-        let frameCount = min(Int(buffer.frameCapacity), data.count / MemoryLayout<Int16>.size)
+        let samples = decodePCM16LittleEndian(data)
+        let frameCount = min(Int(buffer.frameCapacity), samples.count)
         guard frameCount > 0 else {
             buffer.frameLength = 0
             return false
         }
 
+        samples.withUnsafeBufferPointer { source in
+            guard let sourceAddress = source.baseAddress else { return }
+            destination.update(from: sourceAddress, count: frameCount)
+        }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        return true
+    }
+
+    static func decodePCM16LittleEndian(_ data: Data) -> [Float] {
+        let frameCount = data.count / MemoryLayout<Int16>.size
+        guard frameCount > 0 else { return [] }
+
+        var samples = Array(repeating: Float.zero, count: frameCount)
         data.withUnsafeBytes { rawBuffer in
             let bytes = rawBuffer.bindMemory(to: UInt8.self)
             for frame in 0..<frameCount {
                 let byteOffset = frame * 2
                 let bitPattern = UInt16(bytes[byteOffset]) | (UInt16(bytes[byteOffset + 1]) << 8)
-                destination[frame] = Float(Int16(bitPattern: bitPattern)) / 32_768.0
+                samples[frame] = Float(Int16(bitPattern: bitPattern)) / 32_768.0
             }
         }
-        buffer.frameLength = AVAudioFrameCount(frameCount)
-        return true
+        return samples
+    }
+
+    /// Change streaming speed before buffers enter AVAudioEngine. This avoids
+    /// the AVAudioUnitVarispeed format failure seen on macOS 26 while preserving
+    /// 0.5x–2.0x control for Local HD, Gemini, and ElevenLabs PCM streams.
+    static func resample(_ samples: [Float], playbackRate: Float) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+        let rate = max(0.5, min(2.0, playbackRate))
+        guard abs(rate - 1.0) > 0.000_1 else { return samples }
+
+        let outputCount = max(1, Int((Double(samples.count) / Double(rate)).rounded()))
+        var output = Array(repeating: Float.zero, count: outputCount)
+        for outputIndex in 0..<outputCount {
+            let sourcePosition = Double(outputIndex) * Double(rate)
+            let lowerIndex = min(Int(sourcePosition), samples.count - 1)
+            let upperIndex = min(lowerIndex + 1, samples.count - 1)
+            let fraction = Float(sourcePosition - Double(lowerIndex))
+            output[outputIndex] = samples[lowerIndex]
+                + ((samples[upperIndex] - samples[lowerIndex]) * fraction)
+        }
+        return output
     }
 }
 
@@ -546,9 +580,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     private var progressTimer: Timer?
     private var streamingEngine: AVAudioEngine?
     private var streamingNode: AVAudioPlayerNode?
-    /// Varispeed unit between the player node and mixer — required for reliable
-    /// PCM rate control. `AVAudioPlayerNode.rate` is ignored on many macOS builds.
-    private var streamingVarispeed: AVAudioUnitVarispeed?
     private var streamingFormat: AVAudioFormat?
     private var streamingTask: Task<Void, Never>?
     private var pendingStreamingBuffers = 0
@@ -799,9 +830,7 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         if let player {
             player.rate = clamped
         }
-        // Varispeed is the reliable path for streaming PCM (ElevenLabs / Gemini 3.1).
-        streamingVarispeed?.rate = clamped
-        streamingNode?.rate = clamped
+        // Future PCM chunks are resampled at this rate before being scheduled.
     }
 
     func seek(by seconds: TimeInterval) -> Bool {
@@ -827,7 +856,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             engine.stop()
         }
         streamingNode = nil
-        streamingVarispeed = nil
         streamingEngine = nil
         streamingFormat = nil
         pendingStreamingBuffers = 0
@@ -847,8 +875,9 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
         }
     }
 
-    /// Wire `AVAudioPlayerNode` → `AVAudioUnitVarispeed` → mixer so rate changes
-    /// actually affect streaming PCM playback.
+    /// Wire the Float32 player node directly to the mixer. The previous
+    /// AVAudioUnitVarispeed edge failed to initialize with error -10868 on some
+    /// macOS 26 output routes, which made Local HD appear to play silently.
     @discardableResult
     private func setupPCMEngine(sampleRate: Double, volume: Float, initialRate: Float) -> Bool {
         guard let format = CloudPCMPlaybackFormat.make(sampleRate: sampleRate) else {
@@ -857,16 +886,12 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
 
         let engine = AVAudioEngine()
         let node = AVAudioPlayerNode()
-        let varispeed = AVAudioUnitVarispeed()
         let clampedRate = max(0.5, min(2.0, initialRate))
-        varispeed.rate = clampedRate
 
         engine.attach(node)
-        engine.attach(varispeed)
-        engine.connect(node, to: varispeed, format: format)
-        // Keep the source edge in mono Float32 and let the mixer negotiate the
-        // hardware-side sample rate and channel layout.
-        engine.connect(varispeed, to: engine.mainMixerNode, format: nil)
+        // Keep the source edge in mono Float32. The mixer performs the safe
+        // sample-rate/channel conversion needed by the current output device.
+        engine.connect(node, to: engine.mainMixerNode, format: format)
         engine.mainMixerNode.outputVolume = max(0.0, min(1.0, volume))
         node.volume = max(0.0, min(1.0, volume))
 
@@ -878,7 +903,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
 
         streamingEngine = engine
         streamingNode = node
-        streamingVarispeed = varispeed
         streamingFormat = format
         streamEnded = false
         pendingStreamingBuffers = 0
@@ -887,34 +911,29 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     private func scheduleStreamingPCMBuffer(_ data: Data) {
-        guard let format = streamingFormat, streamingNode != nil else { return }
-
-        let frameCount = AVAudioFrameCount(data.count / 2)
-        guard frameCount > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-            return
-        }
-
-        guard CloudPCMPlaybackFormat.copyPCM16LittleEndian(data, into: buffer) else { return }
-
+        guard streamingNode != nil else { return }
+        let samples = CloudPCMPlaybackFormat.decodePCM16LittleEndian(data)
+        guard let buffer = makeFloat32Buffer(samples) else { return }
         scheduleStreamingPCMBuffer(buffer)
     }
 
     private func makeFloat32Buffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
-        guard let format = streamingFormat,
+        let resampled = CloudPCMPlaybackFormat.resample(samples, playbackRate: currentPCMRate)
+        guard !resampled.isEmpty,
+              let format = streamingFormat,
               let buffer = AVAudioPCMBuffer(
                   pcmFormat: format,
-                  frameCapacity: AVAudioFrameCount(samples.count)
+                  frameCapacity: AVAudioFrameCount(resampled.count)
               ),
               let destination = buffer.floatChannelData?.pointee else {
             return nil
         }
 
-        samples.withUnsafeBufferPointer { source in
+        resampled.withUnsafeBufferPointer { source in
             guard let sourceAddress = source.baseAddress else { return }
-            destination.update(from: sourceAddress, count: samples.count)
+            destination.update(from: sourceAddress, count: resampled.count)
         }
-        buffer.frameLength = AVAudioFrameCount(samples.count)
+        buffer.frameLength = AVAudioFrameCount(resampled.count)
         return buffer
     }
 
@@ -923,7 +942,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
 
         if pendingStreamingBuffers == 0 { setBuffering(false) }
         pendingStreamingBuffers += 1
-        streamingVarispeed?.rate = currentPCMRate
         node.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -954,7 +972,6 @@ final class CloudTTSPlayer: NSObject, AVAudioPlayerDelegate {
             engine.stop()
         }
         streamingNode = nil
-        streamingVarispeed = nil
         streamingEngine = nil
         streamingFormat = nil
         resolveContinuation()

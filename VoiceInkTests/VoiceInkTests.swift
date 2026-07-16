@@ -40,6 +40,48 @@ struct VoiceInkTests {
         #expect(abs(output[4] - (Float(Int16.max) / 32_768.0)) < 0.000_01)
     }
 
+    @MainActor
+    @Test func streamingFloat32PlaybackKeepsEngineAliveUntilAudioFinishes() async {
+        let player = CloudTTSPlayer()
+        let oneSecondOfSilence = Array(repeating: Float.zero, count: 24_000)
+        let stream = AsyncStream<[Float]> { continuation in
+            continuation.yield(oneSecondOfSilence)
+            continuation.finish()
+        }
+        let startedAt = Date()
+
+        await player.playStreamingFloat32(
+            from: stream,
+            sampleRate: 24_000,
+            volume: 0,
+            initialRate: 1
+        )
+
+        #expect(Date().timeIntervalSince(startedAt) >= 0.5)
+    }
+
+    @MainActor
+    @Test func streamingFloat32PlaybackAppliesSpeedWithoutAnAudioEffectUnit() async {
+        let player = CloudTTSPlayer()
+        let oneSecondOfSilence = Array(repeating: Float.zero, count: 24_000)
+        let stream = AsyncStream<[Float]> { continuation in
+            continuation.yield(oneSecondOfSilence)
+            continuation.finish()
+        }
+        let startedAt = Date()
+
+        await player.playStreamingFloat32(
+            from: stream,
+            sampleRate: 24_000,
+            volume: 0,
+            initialRate: 2
+        )
+
+        let elapsed = Date().timeIntervalSince(startedAt)
+        #expect(elapsed >= 0.25)
+        #expect(elapsed < 0.8)
+    }
+
     @Test func paidCloudRequestIsBlockedBeforeItExceedsTheHardBudget() {
         let decision = PaidTTSBudgetPolicy.decision(
             provider: .openai,
@@ -392,23 +434,23 @@ struct VoiceInkTests {
 
     @Test @MainActor func pcmPipelineInitiallyPreparesOnlyCurrentAndTwoFutureSegments() async {
         var requested: [Int] = []
+        var continuations: [AsyncStream<Data>.Continuation] = []
         let stream = PCMStreamConcatenator.concatenate(count: 6) { index in
             requested.append(index)
             return PCMStreamSegment.wrapping(AsyncStream { continuation in
-                Task {
-                    try? await Task.sleep(for: .milliseconds(100))
-                    continuation.yield(Data([UInt8(index)]))
-                    continuation.finish()
-                }
+                continuations.append(continuation)
             })
         }
 
         let consumer = Task { @MainActor in
             for await _ in stream { }
         }
-        try? await Task.sleep(for: .milliseconds(20))
+        for _ in 0..<20 where requested.count < 3 {
+            await Task.yield()
+        }
 
         #expect(Set(requested) == Set([0, 1, 2]))
+        continuations.forEach { $0.finish() }
         consumer.cancel()
     }
 
